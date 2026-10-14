@@ -1,0 +1,46 @@
+@startuml nad-containers
+!include <C4/C4_Container>
+LAYOUT_LEFT_RIGHT()
+LAYOUT_WITH_LEGEND()
+skinparam dpi 150
+
+title NAD - Container view (reference deployment)
+
+Person(admin, "Network administrator", "Reviews the dashboard and alerts")
+
+System_Boundary(site, "Company network") {
+  System_Ext(users, "Users (~80)", "Workstations and phones")
+  System_Ext(gateway, "MikroTik hAP ax", "Gateway, exports SNMP, Traffic-Flow, syslog")
+  System_Ext(uplink, "Starlink", "Satellite uplink")
+}
+
+System_Boundary(nad, "NAD host (Linux, systemd)") {
+  Container(telegraf, "Telegraf", "SNMP + ICMP", "Polls router counters, measures latency and loss")
+  Container(goflow, "goflow2", "NetFlow/IPFIX", "Decodes flow records to JSON")
+  Container(rsyslog, "rsyslog", "Syslog receiver", "Stores router logs")
+  Container(ingest, "Ingestor", "Python", "Parses raw files, builds 1-minute windows")
+  ContainerDb(store, "Store", "SQLite + Parquet", "Windows, scores, anomaly events")
+  Container(detector, "Detector", "Python, scikit-learn", "Features, Isolation Forest, seasonal baseline")
+  Container(dashboard, "Dashboard", "Streamlit", "Statistics and highlighted anomalies")
+  Container(alerts, "Alert hook", "Webhook, optional", "Notifies on new anomaly events")
+}
+
+Rel(users, gateway, "Traffic")
+Rel(gateway, uplink, "Traffic")
+
+Rel(telegraf, gateway, "SNMP polling")
+Rel(telegraf, uplink, "ICMP probes")
+Rel(gateway, goflow, "Traffic-Flow", "UDP")
+Rel(gateway, rsyslog, "Syslog", "UDP")
+
+Rel(telegraf, ingest, "JSON lines")
+Rel(goflow, ingest, "JSON lines")
+Rel(rsyslog, ingest, "Log files")
+Rel(ingest, store, "Writes windows")
+Rel(detector, store, "Reads windows, writes scores")
+Rel(dashboard, store, "Reads")
+Rel(detector, alerts, "New anomaly events")
+
+Rel(admin, dashboard, "Views")
+Rel(alerts, admin, "Notifies")
+@enduml
