@@ -27,9 +27,9 @@ normal du réseau à partir de ses propres données et signale ce qui s'en écar
 
 ## Environnement de référence
 
-Environ 80 utilisateurs derrière une passerelle MikroTik hAP ax, avec une liaison
-montante Starlink. La passerelle exporte la télémétrie ; NAD tourne sur un hôte
-Linux séparé et ne se trouve jamais dans le chemin du trafic.
+Un petit réseau d'entreprise derrière une passerelle MikroTik hAP ax, avec une
+liaison montante Starlink. La passerelle exporte la télémétrie ; NAD tourne sur
+un hôte Linux séparé et ne se trouve jamais dans le chemin du trafic.
 
 ## Architecture
 
@@ -62,7 +62,7 @@ Linux séparé et ne se trouve jamais dans le chemin du trafic.
 
 Toutes les sources sont agrégées en fenêtres fixes (1 minute par défaut,
 configurable). Une ligne par fenêtre, un seul schéma quel que soit l'équipement
-source.
+source. Sur un petit réseau, des fenêtres plus larges lissent les pics courts.
 
 ### Caractéristiques (features)
 
@@ -117,7 +117,7 @@ Séries temporelles avec anomalies mises en évidence, état actuel, plus gros
 | Déploiement | Ansible + systemd | Un seul hôte, aucune couche de conteneurs à maintenir | Docker Compose sur un serveur |
 
 Le comparatif complet des outils candidats, avec leurs forces et leurs limites,
-se trouve dans [`docs/tooling.md`](docs/tooling.md).
+se trouve dans [`docs/tools/tooling.fr.md`](docs/tools/tooling.fr.md).
 
 ## Modes dégradés
 
@@ -165,6 +165,7 @@ scenarios/      Anomalies injectées avec leurs étiquettes attendues
 data/           Local uniquement (ignoré par Git) + petits échantillons anonymisés
 docs/           Architecture, outils, rapport
   diagrams/     Sources PlantUML (.puml) et images générées (.png, .svg)
+  tools/        Comparatif des outils et décisions (tooling.md)
 ```
 
 ## Validation

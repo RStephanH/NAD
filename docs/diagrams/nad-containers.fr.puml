@@ -9,7 +9,7 @@ title NAD - Vue conteneurs (déploiement de référence)
 Person(admin, "Administrateur réseau", "Consulte le tableau de bord et les alertes")
 
 System_Boundary(site, "Réseau de l'entreprise") {
-  System_Ext(users, "Utilisateurs (~80)", "Postes de travail et téléphones")
+  System_Ext(users, "Utilisateurs", "Postes de travail, téléphones et autres appareils")
   System_Ext(gateway, "MikroTik hAP ax", "Passerelle, exporte SNMP, Traffic-Flow, syslog")
   System_Ext(uplink, "Starlink", "Liaison montante satellite")
 }

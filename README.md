@@ -1,5 +1,7 @@
 # NAD — Network Anomaly Detection
 
+**English** | [Français](README.fr.md)
+
 > Learns what "normal" looks like on a company network, then flags unusual
 > behavior automatically.
 
@@ -22,9 +24,9 @@ data and reports what deviates from it.
 
 ## Reference environment
 
-About 80 users behind a MikroTik hAP ax gateway, with a Starlink uplink. The
-gateway exports telemetry; NAD runs on a separate Linux host and never sits in
-the traffic path.
+A small company network behind a MikroTik hAP ax gateway, with a Starlink
+uplink. The gateway exports telemetry; NAD runs on a separate Linux host and
+never sits in the traffic path.
 
 ## Architecture
 
@@ -56,7 +58,8 @@ the traffic path.
 ### Normalized windows
 
 All sources are aggregated into fixed windows (default 1 minute, configurable).
-One row per window, one schema regardless of the source device.
+One row per window, one schema regardless of the source device. On small
+networks, wider windows smooth out short bursts.
 
 ### Features
 
@@ -105,7 +108,7 @@ table of anomaly events.
 | Deployment | Ansible + systemd | One host, no container layer to maintain | Docker Compose on a server |
 
 The full comparison of candidate tools, with strengths and limits, is in
-[`docs/tooling.md`](docs/tooling.md).
+[`docs/tools/tooling.md`](docs/tools/tooling.md).
 
 ## Fallback modes
 
@@ -149,6 +152,7 @@ scenarios/      Injected anomalies with expected labels
 data/           Local only (git-ignored) plus small anonymized samples
 docs/           Architecture, tooling, report
   diagrams/     PlantUML sources (.puml) and generated images (.png, .svg)
+  tools/        Tool comparison and decisions (tooling.md)
 ```
 
 ## Validation

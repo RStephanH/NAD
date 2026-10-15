@@ -9,7 +9,7 @@ title NAD - Container view (reference deployment)
 Person(admin, "Network administrator", "Reviews the dashboard and alerts")
 
 System_Boundary(site, "Company network") {
-  System_Ext(users, "Users (~80)", "Workstations and phones")
+  System_Ext(users, "Users", "Workstations, phones and other devices")
   System_Ext(gateway, "MikroTik hAP ax", "Gateway, exports SNMP, Traffic-Flow, syslog")
   System_Ext(uplink, "Starlink", "Satellite uplink")
 }
