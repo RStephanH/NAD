@@ -9,14 +9,15 @@ title NAD - Vue conteneurs (déploiement de référence)
 Person(admin, "Administrateur réseau", "Consulte le tableau de bord et les alertes")
 
 System_Boundary(site, "Réseau de l'entreprise") {
-  System_Ext(users, "Utilisateurs", "Postes de travail, téléphones et autres appareils")
-  System_Ext(gateway, "MikroTik hAP ax", "Passerelle, exporte SNMP, Traffic-Flow, syslog")
+  System_Ext(users, "Utilisateurs", "Postes de travail et téléphones")
+  System_Ext(gateway, "MikroTik hAP ac²", "Passerelle (RouterOS 7), NAT, exporte Traffic-Flow, SNMP, syslog")
+  System_Ext(slrouter, "Routeur Starlink", "Second NAT, premier saut vers la liaison montante")
   System_Ext(uplink, "Starlink", "Liaison montante satellite")
 }
 
 System_Boundary(nad, "Hôte NAD (Linux, systemd)") {
   Container(telegraf, "Telegraf", "SNMP + ICMP", "Interroge les compteurs du routeur, mesure latence et perte")
-  Container(goflow, "goflow2", "NetFlow/IPFIX", "Décode les flux en JSON")
+  Container(goflow, "goflow2", "NetFlow v9/IPFIX", "Décode les flux en JSON")
   Container(rsyslog, "rsyslog", "Récepteur syslog", "Stocke les journaux du routeur")
   Container(ingest, "Ingesteur", "Python", "Lit les fichiers bruts, construit des fenêtres de 1 minute")
   ContainerDb(store, "Stockage", "SQLite + Parquet", "Fenêtres, scores, événements d'anomalie")
@@ -26,12 +27,14 @@ System_Boundary(nad, "Hôte NAD (Linux, systemd)") {
 }
 
 Rel(users, gateway, "Trafic")
-Rel(gateway, uplink, "Trafic")
+Rel(gateway, slrouter, "Trafic")
+Rel(slrouter, uplink, "Trafic")
 
 Rel(telegraf, gateway, "Interrogation SNMP")
-Rel(telegraf, uplink, "Sondes ICMP")
-Rel(gateway, goflow, "Traffic-Flow", "UDP")
-Rel(gateway, rsyslog, "Syslog", "UDP")
+Rel(telegraf, slrouter, "Sondes ICMP (premier saut)")
+Rel(telegraf, uplink, "Sondes ICMP (cibles Internet)")
+Rel(gateway, goflow, "Traffic-Flow", "UDP 2055")
+Rel(gateway, rsyslog, "Syslog", "UDP 514")
 
 Rel(telegraf, ingest, "Lignes JSON")
 Rel(goflow, ingest, "Lignes JSON")

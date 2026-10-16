@@ -27,13 +27,14 @@ normal du réseau à partir de ses propres données et signale ce qui s'en écar
 
 ## Environnement de référence
 
-Un petit réseau d'entreprise derrière une passerelle MikroTik hAP ax, avec une
-liaison montante Starlink. La passerelle exporte la télémétrie ; NAD tourne sur
-un hôte Linux séparé et ne se trouve jamais dans le chemin du trafic.
+Un petit réseau d'entreprise (environ 80 utilisateurs) derrière une passerelle
+MikroTik hAP ac² (RouterOS 7), elle-même derrière le routeur Starlink (double
+NAT). La passerelle exporte la télémétrie ; NAD tourne sur un hôte Linux séparé
+et ne se trouve jamais dans le chemin du trafic.
 
 ## Architecture
 
-![Architecture de NAD](docs/diagrams/nad-containers-fr.png)
+![Architecture de NAD](docs/diagrams/nad-containers.fr.png)
 
 | Composant | Rôle | Implémentation |
 |---|---|---|
@@ -62,7 +63,7 @@ un hôte Linux séparé et ne se trouve jamais dans le chemin du trafic.
 
 Toutes les sources sont agrégées en fenêtres fixes (1 minute par défaut,
 configurable). Une ligne par fenêtre, un seul schéma quel que soit l'équipement
-source. Sur un petit réseau, des fenêtres plus larges lissent les pics courts.
+source.
 
 ### Caractéristiques (features)
 
@@ -74,6 +75,11 @@ source. Sur un petit réseau, des fenêtres plus larges lissent les pics courts.
   par cible
 - Santé de l'équipement : CPU, mémoire, nombre d'événements de journal
 - Contexte temporel : heure du jour et jour de la semaine (encodage cyclique)
+
+Les caractéristiques par hôte sont calculées à partir des flux montants. Les
+flux descendants sont exportés avant la traduction NAT inverse : ils portent
+l'adresse WAN de la passerelle au lieu de celle du poste interne. Ils comptent
+quand même dans les totaux.
 
 ### Détection
 
@@ -87,7 +93,8 @@ source. Sur un petit réseau, des fenêtres plus larges lissent les pics courts.
   caractéristiques qui y contribuent le plus, afin de pouvoir l'expliquer.
 - Les caractéristiques de qualité de la liaison montante sont tenues à part, pour
   distinguer un problème de liaison d'un comportement anormal à l'intérieur du
-  réseau.
+  réseau. Sonder à la fois le routeur Starlink (premier saut) et des cibles
+  Internet permet de distinguer la liaison locale de la liaison satellite.
 
 ### Tableau de bord
 
@@ -165,7 +172,8 @@ scenarios/      Anomalies injectées avec leurs étiquettes attendues
 data/           Local uniquement (ignoré par Git) + petits échantillons anonymisés
 docs/           Architecture, outils, rapport
   diagrams/     Sources PlantUML (.puml) et images générées (.png, .svg)
-  tools/        Comparatif des outils et décisions (tooling.md)
+  tools/        Comparatifs d'outils et choix technologiques
+  guides/       Guides pas à pas (mise en place, justification, commandes)
 ```
 
 ## Validation

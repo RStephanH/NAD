@@ -9,14 +9,15 @@ title NAD - Container view (reference deployment)
 Person(admin, "Network administrator", "Reviews the dashboard and alerts")
 
 System_Boundary(site, "Company network") {
-  System_Ext(users, "Users", "Workstations, phones and other devices")
-  System_Ext(gateway, "MikroTik hAP ax", "Gateway, exports SNMP, Traffic-Flow, syslog")
+  System_Ext(users, "Users", "Workstations and phones")
+  System_Ext(gateway, "MikroTik hAP ac²", "Gateway (RouterOS 7), NAT, exports Traffic-Flow, SNMP, syslog")
+  System_Ext(slrouter, "Starlink router", "Second NAT, first hop to the uplink")
   System_Ext(uplink, "Starlink", "Satellite uplink")
 }
 
 System_Boundary(nad, "NAD host (Linux, systemd)") {
   Container(telegraf, "Telegraf", "SNMP + ICMP", "Polls router counters, measures latency and loss")
-  Container(goflow, "goflow2", "NetFlow/IPFIX", "Decodes flow records to JSON")
+  Container(goflow, "goflow2", "NetFlow v9/IPFIX", "Decodes flow records to JSON")
   Container(rsyslog, "rsyslog", "Syslog receiver", "Stores router logs")
   Container(ingest, "Ingestor", "Python", "Parses raw files, builds 1-minute windows")
   ContainerDb(store, "Store", "SQLite + Parquet", "Windows, scores, anomaly events")
@@ -26,12 +27,14 @@ System_Boundary(nad, "NAD host (Linux, systemd)") {
 }
 
 Rel(users, gateway, "Traffic")
-Rel(gateway, uplink, "Traffic")
+Rel(gateway, slrouter, "Traffic")
+Rel(slrouter, uplink, "Traffic")
 
 Rel(telegraf, gateway, "SNMP polling")
-Rel(telegraf, uplink, "ICMP probes")
-Rel(gateway, goflow, "Traffic-Flow", "UDP")
-Rel(gateway, rsyslog, "Syslog", "UDP")
+Rel(telegraf, slrouter, "ICMP probes (first hop)")
+Rel(telegraf, uplink, "ICMP probes (Internet targets)")
+Rel(gateway, goflow, "Traffic-Flow", "UDP 2055")
+Rel(gateway, rsyslog, "Syslog", "UDP 514")
 
 Rel(telegraf, ingest, "JSON lines")
 Rel(goflow, ingest, "JSON lines")

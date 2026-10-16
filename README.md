@@ -1,6 +1,6 @@
 # NAD — Network Anomaly Detection
 
-**English** | [Français](README.fr.md)
+[Français](README.fr.md) | **English**
 
 > Learns what "normal" looks like on a company network, then flags unusual
 > behavior automatically.
@@ -24,9 +24,10 @@ data and reports what deviates from it.
 
 ## Reference environment
 
-A small company network behind a MikroTik hAP ax gateway, with a Starlink
-uplink. The gateway exports telemetry; NAD runs on a separate Linux host and
-never sits in the traffic path.
+A small company network (about 80 users) behind a MikroTik hAP ac² gateway
+(RouterOS 7), itself behind the Starlink router (double NAT). The gateway
+exports telemetry; NAD runs on a separate Linux host and never sits in the
+traffic path.
 
 ## Architecture
 
@@ -58,8 +59,7 @@ never sits in the traffic path.
 ### Normalized windows
 
 All sources are aggregated into fixed windows (default 1 minute, configurable).
-One row per window, one schema regardless of the source device. On small
-networks, wider windows smooth out short bursts.
+One row per window, one schema regardless of the source device.
 
 ### Features
 
@@ -70,6 +70,10 @@ networks, wider windows smooth out short bursts.
 - Device health: CPU, memory, log event count
 - Time context: hour of day and day of week (cyclical encoding)
 
+Per-host features are computed from outbound flows. Inbound flows are exported
+before reverse NAT, so they carry the gateway's WAN address instead of the
+internal host; they still count toward the totals.
+
 ### Detection
 
 - An Isolation Forest scores each window against the learned baseline.
@@ -79,7 +83,9 @@ networks, wider windows smooth out short bursts.
 - Each anomaly event stores a timestamp, a score and its top contributing
   features, so it can be explained.
 - Uplink-quality features are kept separate so that link problems can be told
-  apart from misbehavior inside the network.
+  apart from misbehavior inside the network. Probing both the Starlink router
+  (first hop) and Internet targets tells the local link apart from the
+  satellite link.
 
 ### Dashboard
 
@@ -152,7 +158,8 @@ scenarios/      Injected anomalies with expected labels
 data/           Local only (git-ignored) plus small anonymized samples
 docs/           Architecture, tooling, report
   diagrams/     PlantUML sources (.puml) and generated images (.png, .svg)
-  tools/        Tool comparison and decisions (tooling.md)
+  tools/        Tool comparisons and technology choices
+  guides/       Step-by-step workflow guides (setup, rationale, commands)
 ```
 
 ## Validation
