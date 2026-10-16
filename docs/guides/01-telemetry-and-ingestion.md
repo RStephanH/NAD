@@ -6,12 +6,16 @@
 the work.
 **Goal:** get real telemetry flowing from the gateway router to the NAD host,
 then design the ingestor from real samples.
-**Status:** in progress. Flow export tested on 2026-10-15 (safe mode, reverted).
-SNMP, syslog and the cross-check are not tested yet. Fill in the results log
-(section 11) as you go.
+**Status:** in progress.
 
-Items marked **(verify)** depend on the RouterOS or tool version and must be
-checked against current documentation.
+- Flow export: tested on 2026-10-15 (safe mode, reverted afterwards).
+- SNMP v3: configured and tested on 2026-10-16, kept on the router (read-only,
+  encrypted, restricted to the NAD host).
+- Syslog, router load measurement and cross-check: not done yet.
+
+Fill in the results log (section 11) as you go. Items marked **(verify)**
+depend on the RouterOS or tool version and must be checked against current
+documentation.
 
 ## 1. Why this order
 
@@ -53,8 +57,9 @@ What follows from this:
 - A Linux host on the same LAN as the router (the future NAD host), preferably
   on a cable rather than Wi-Fi (flows and syslog are UDP, with no retries), with
   a fixed address (static DHCP lease).
-- On the host: `tcpdump`, `nc` (netcat), `jq`, the Net-SNMP command-line tools
-  (`snmpwalk`, `snmpget`), `rsyslog`, and `goflow2` (a release binary such as
+- On the host: `tcpdump`, `nc` (netcat), `jq`, the Net-SNMP client tools
+  (`snmpget`, `snmpwalk`: package `net-snmp` on Arch, `snmp` on
+  Debian/Ubuntu), `rsyslog`, and `goflow2` (a release binary such as
   `goflow2-2.2.7-linux-amd64` works without installing Go).
 - The router's clock synchronized (see step 1.4).
 
@@ -65,12 +70,13 @@ flowchart LR
   S0["Step 0<br/>Back up router config"] --> S1["Step 1<br/>Enable telemetry on router"]
   S1 --> S2["Step 2<br/>Prepare receivers on host"]
   S2 --> S3["Step 3<br/>Capture real samples"]
-  S3 --> S4["Step 4<br/>Cross-check flows vs SNMP"]
+  S3 --> S4["Step 4<br/>Load measurement and cross-check"]
   S4 --> S5["Step 5<br/>Design the ingestor"]
 ```
 
-In practice, step 2 (the host listening) must be ready **before** the router
-starts exporting in step 1.
+In practice the host side comes first for each channel: the SNMP credentials
+(step 2) before the SNMP user on the router (step 1.2), and the flow receiver
+(step 2) before the flow export (step 1.1).
 
 ---
 
@@ -97,10 +103,15 @@ connectivity. A backup and a way to undo make experimenting safe.
 /interface bridge print
 /interface bridge port print
 /ip address print
+
+# Existing SNMP setup and input firewall chain
+/snmp print
+/snmp community print
+/ip firewall filter print where chain=input
 ```
 
-From the host, download the backup and keep it outside the repository. If the
-router's storage is nearly full, remove the file from the router afterwards:
+From the host, download the backup and keep it outside the repository. The
+router's storage is nearly full on this model, so remove the file afterwards:
 
 ```bash
 mkdir -p ~/nad-private
@@ -113,8 +124,7 @@ scp <admin-user>@<router-ip>:before-nad.rsc ~/nad-private/
 
 - **Safe mode:** `Ctrl+X` turns it on and the prompt shows `<SAFE>`. Leaving
   safe mode with `Ctrl+X` **keeps** the changes; `Ctrl+D`, or a dropped
-  session, **undoes** everything done since safe mode was turned on. During a
-  test period, never leave with `Ctrl+X`.
+  session, **undoes** everything done since safe mode was turned on.
 - **Do not commit the export file.** It describes the network and includes the
   router's serial number.
 - **Write down** from `/ip address print`: the LAN subnet, the WAN address (it
@@ -151,10 +161,6 @@ destinations.
 # Verify
 /ip traffic-flow print
 /ip traffic-flow target print
-
-# Load check: compare cpu-load and free-memory with the values from step 0,
-# right after enabling and again 10 minutes later
-/system resource print
 ```
 
 **Observed on RouterOS 7.12 (hAP ac²):** exporting from the LAN bridge alone
@@ -167,29 +173,74 @@ Traffic between two LAN ports in hardware offload is switched by the switch
 chip and never reaches the CPU, so it does not appear in flows. This is a known
 limit, acceptable because most traffic goes to the Internet.
 
+The real cost of flow export on the router CPU is measured in step 4.
+
 ### 1.2 SNMP (counters and device health)
 
 **Why:** SNMP gives interface throughput, CPU and memory. It is also the
-reference against which flow data is checked. **Not tested yet.**
+reference against which flow data is checked.
+
+Prepare the host credentials first (step 2, "SNMP client"), then on the router,
+in safe mode:
+
+**a) Look at what exists.** Note whether a `public` community exists, which
+addresses it accepts, and whether the `input` firewall chain has static rules.
 
 ```
-# Enable the SNMP service
+/snmp print
+/snmp community print
+/ip firewall filter print where chain=input
+```
+
+**b) Disable the default community, before enabling the service.** `public` is
+the default name everyone knows, open to every address, with no encryption.
+Disabling it first means the router never answers everyone.
+
+```
+# Default entries usually cannot be deleted, so disable it (verify)
+/snmp community disable [find name=public]
+
+# Check: the "public" line must show an X (disabled)
+/snmp community print
+```
+
+If the command is refused, restrict it instead:
+`/snmp community set [find name=public] addresses=<nad-ip>/32`.
+
+**c) Create the SNMPv3 user** (one line, with the `AUTH` and `PRIV` values
+generated on the host):
+
+```
+/snmp community add name=nad addresses=<nad-ip>/32 read-access=yes write-access=no security=private authentication-protocol=SHA1 authentication-password=<AUTH> encryption-protocol=AES encryption-password=<PRIV>
+```
+
+In RouterOS, `/snmp community` holds access profiles. With `security=private`
+the entry is an **SNMPv3 user** (authenticated and encrypted), and `name`
+becomes the user name: it must match `defSecurityName` on the host. Recent
+RouterOS versions offer stronger algorithms than SHA1 **(verify)**; if you pick
+one, change `defAuthType` on the host too.
+
+**d) Enable the service and check:**
+
+```
 /snmp set enabled=yes
-
-# SNMPv3 user "nad": read-only, only the NAD host may ask, authenticated and encrypted
-# (replace both passwords; never commit real ones)
-/snmp community add name=nad addresses=<nad-ip>/32 read-access=yes write-access=no \
-    security=private authentication-protocol=SHA1 authentication-password=CHANGE_ME \
-    encryption-protocol=AES encryption-password=CHANGE_ME_TOO
-
-# Verify
 /snmp print
 /snmp community print
 ```
 
-**Why SNMPv3 and a /32 restriction:** older SNMP versions send a shared password
-in clear text. Restricting to one address and read-only access limits the damage
-if the credentials leak.
+`nad` must be active and restricted to `<nad-ip>/32`; `public` must be disabled.
+`trap-community: public` in `/snmp print` is harmless: without a `trap-target`,
+no trap is sent.
+
+**e) Keep or undo.** Once the tests of step 2 pass, the SNMP setup can stay:
+read-only, SNMPv3, encrypted, one allowed address. Leave safe mode with
+`Ctrl+X` to keep it. A dropped session in safe mode would otherwise undo SNMP
+in the middle of a long measurement (step 4).
+
+**Observed (hAP ac², RouterOS 7.12):** the SNMP service was disabled, the
+`public` community existed (default, all addresses `::/0`, security `none`),
+and the `input` chain only had dynamic rules created by the Hotspot. With no
+static rule, nothing blocks or protects access to the router itself.
 
 ### 1.3 Syslog (events)
 
@@ -222,9 +273,9 @@ is off, its data lands in the wrong window.
 /system clock print
 ```
 
-### 1.5 Undo after a test session
+### 1.5 Undo
 
-**Why:** during the test period nothing should stay on the production router.
+**Flows, after each test session:**
 
 ```
 # Remove the export target and restore the defaults
@@ -238,16 +289,27 @@ is off, its data lands in the wrong window.
 
 Then leave safe mode with `Ctrl+D` (undo), never `Ctrl+X` (keep).
 
+**SNMP, only if it must be removed completely:**
+
+```
+/snmp set enabled=no
+/snmp community remove [find name=nad]
+```
+
+Leave `public` disabled even then: it is safer than the original state.
+
 ---
 
 ## 7. Step 2 — Prepare the receivers on the host
 
 **Why:** the router pushes flows and syslog without waiting. If nothing is
-listening, those messages are lost.
+listening, those messages are lost. For SNMP, the host asks, so it needs the
+credentials before the router user exists.
 
 If a host firewall is active (check with `sudo ufw status verbose`), allow the
-router to reach the receivers. The rule only matches if the router really sends
-from `<router-lan-ip>` (see `src-address` in step 1.1):
+router to reach the flow and syslog receivers. The rule only matches if the
+router really sends from `<router-lan-ip>` (see `src-address` in step 1.1).
+SNMP is started by the host, so it needs no inbound rule.
 
 ```bash
 # Allow flows and syslog from the router only
@@ -255,6 +317,87 @@ sudo ufw allow from <router-lan-ip> to any port 2055 proto udp comment 'NAD netf
 sudo ufw allow from <router-lan-ip> to any port 514 proto udp comment 'NAD syslog'
 sudo ufw status numbered | grep NAD
 ```
+
+### SNMP client
+
+```bash
+# Client tools only. Do NOT enable the snmpd service: that is the agent,
+# which NAD does not need.
+sudo pacman -S --needed net-snmp      # Debian/Ubuntu: sudo apt install snmp
+snmpget --version
+```
+
+Generate two passphrases (Net-SNMP requires at least 8 characters) and store
+them in a file only you can read:
+
+```bash
+AUTH=$(openssl rand -base64 24 | tr -d '/+=' | head -c 20)
+PRIV=$(openssl rand -base64 24 | tr -d '/+=' | head -c 20)
+
+mkdir -p ~/.snmp
+(umask 077; cat > ~/.snmp/snmp.conf <<EOF
+defVersion 3
+defSecurityLevel authPriv
+defSecurityName nad
+defAuthType SHA
+defAuthPassphrase $AUTH
+defPrivType AES
+defPrivPassphrase $PRIV
+EOF
+)
+
+# Show them once: they are needed for the router command (step 1.2 c)
+echo "AUTH=$AUTH"; echo "PRIV=$PRIV"
+```
+
+Clear the screen after copying the two values. With this file, commands shrink
+to `snmpget <ip> <oid>`, and no password appears in the shell history or in
+`ps`.
+
+### SNMP tests, from simplest to most useful
+
+```bash
+R=<router-lan-ip>
+
+# 1) Does the router answer? System description and uptime
+snmpget $R 1.3.6.1.2.1.1.1.0 1.3.6.1.2.1.1.3.0
+
+# 2) Interface names with their index (the index is the last number of the OID)
+snmpwalk $R 1.3.6.1.2.1.31.1.1.1.1
+
+# 3) CPU load, one value per core
+snmpwalk -Oqv $R 1.3.6.1.2.1.25.3.3.1.2
+
+# 4) Storage: description, allocation unit, size, used
+snmpwalk $R 1.3.6.1.2.1.25.2.3.1.3
+snmpwalk $R 1.3.6.1.2.1.25.2.3.1.4
+snmpwalk $R 1.3.6.1.2.1.25.2.3.1.5
+snmpwalk $R 1.3.6.1.2.1.25.2.3.1.6
+
+# 5) 64-bit byte counters (in, out) for one interface
+snmpget $R 1.3.6.1.2.1.31.1.1.1.6.<idx> 1.3.6.1.2.1.31.1.1.1.10.<idx>
+```
+
+| Test | Expected result |
+|---|---|
+| 1 | A description mentioning the router model, then the uptime |
+| 2 | One line per interface, such as `...1.8 = STRING: bridge1` |
+| 3 | One percentage per core (four on the hAP ac²) |
+| 4 | Find "main memory" in the descriptions; used % = `used / size` on the same row (index 65536 on this router) |
+| 5 | Two large numbers that **increase** when you run the command again 10 seconds later |
+
+Notes:
+
+- Write down the **indexes** of the LAN bridge and the WAN interface in the
+  results log: the cross-check needs them.
+- Counters are read **from the router's point of view**: on the LAN bridge,
+  "in" is what LAN machines send out (upload), "out" is what the router delivers
+  to them (download).
+- Numeric OIDs work without any MIB installed. Names such as `ifName` need MIB
+  files, which some distributions do not ship.
+- Interface indexes can change when dynamic interfaces appear (VPN sessions).
+  For continuous collection, resolve indexes to names (`ifName`) at each read
+  instead of relying on a fixed number.
 
 ### Flow receiver
 
@@ -293,17 +436,6 @@ timeout 15 nc -ul 2055 | xxd | head -5
 
 goflow2 also serves metrics on port 8080. If another service already uses that
 port, start goflow2 with `-addr :9081`.
-
-### SNMP check
-
-```bash
-# Walk the "bytes received per interface" table (ifInOctets)
-# -v3 -l authPriv: SNMPv3 with authentication and encryption
-snmpwalk -v3 -l authPriv -u nad -a SHA -A 'CHANGE_ME' -x AES -X 'CHANGE_ME_TOO' \
-    <router-lan-ip> 1.3.6.1.2.1.2.2.1.10
-```
-
-SNMP is started by the host, so no inbound firewall rule is needed for it.
 
 ### Syslog receiver
 
@@ -370,42 +502,82 @@ per day, hence the ingestor's field selection and file rotation.
 A test session validates the **pipeline**, not the baseline. The baseline is
 built later from continuous collection.
 
-## 9. Step 4 — Cross-check flows against SNMP
+## 9. Step 4 — Load measurement and cross-check
+
+### 4.1 Router load (phases A/B/C)
+
+**Why:** flow export costs CPU and RAM on a modest router that serves the whole
+company. One reading is not enough: the load varies with usage. Three phases of
+10 minutes each, measured the same way, separate the cost of the export from
+the natural variation:
+
+| Phase | Flow export | Purpose |
+|---|---|---|
+| A | Off | Reference load |
+| B | On | Load with export |
+| C | Off again | Checks that the load returns to the reference (control) |
+
+Avoid large downloads during the measurement, and run all three phases in a
+row, at a similar time of day.
+
+```bash
+R=<router-lan-ip>
+mkdir -p ~/nad-samples
+# Columns: UTC time, mean CPU %, busiest core %, memory used %
+while true; do
+  cpu=$(snmpwalk -Oqv $R 1.3.6.1.2.1.25.3.3.1.2 | awk '{s+=$1; if ($1>m) m=$1} END {printf "%.1f %d", s/NR, m}')
+  mem=$(snmpget -Oqv $R 1.3.6.1.2.1.25.2.3.1.6.65536 1.3.6.1.2.1.25.2.3.1.5.65536 | paste -sd' ' | awk '{printf "%.1f", 100*$1/$2}')
+  echo "$(date -u +%FT%TZ) $cpu $mem"
+  sleep 10
+done | tee -a ~/nad-samples/cpu.log
+```
+
+The busiest core matters: one core can saturate before the average looks high.
+Note the start time of each phase, then compute the averages per phase:
+
+```bash
+# Mean CPU, busiest-core maximum and mean memory between two UTC times
+awk -v s="<start>" -v e="<end>" '$1>=s && $1<e {c+=$2; if ($3>m) m=$3; r+=$4; n++}
+  END {printf "samples=%d cpu_mean=%.1f core_max=%d mem_mean=%.1f\n", n, c/n, m, r/n}' ~/nad-samples/cpu.log
+```
+
+### 4.2 Cross-check flows against SNMP
 
 **Why:** flow export can undercount (accelerated forwarding, hardware offload)
 or overcount (the same traffic exported from several interfaces), and UDP can
 drop packets. SNMP counters come from the interface itself and serve as the
 reference. **Not tested yet.**
 
-```bash
-# 1) List interface names and indexes (ifDescr)
-snmpwalk -v3 -l authPriv -u nad -a SHA -A 'CHANGE_ME' -x AES -X 'CHANGE_ME_TOO' \
-    <router-lan-ip> 1.3.6.1.2.1.2.2.1.2
+Use the LAN bridge only: its two counters cover both directions, and unlike the
+WAN they exclude VPN encapsulation and traffic dropped by the firewall.
 
-# 2) Read the 64-bit received-bytes counter twice, 5 minutes apart
-#    (64-bit counters avoid wrap-around on fast links)
-IFX=<ifIndex>
-OID=1.3.6.1.2.1.31.1.1.1.6.$IFX
-snmpget -v3 -l authPriv -u nad -a SHA -A 'CHANGE_ME' -x AES -X 'CHANGE_ME_TOO' <router-lan-ip> $OID
+| SNMP counter on the LAN bridge | Matches flows with | Direction |
+|---|---|---|
+| In (`ifHCInOctets`, OID ...31.1.1.1.6) | `in_if` = bridge index | Outbound (upload) |
+| Out (`ifHCOutOctets`, OID ...31.1.1.1.10) | `out_if` = bridge index | Inbound (download) |
+
+```bash
+R=<router-lan-ip>
+B=<lan-ifindex>
+
+# 1) Read both counters, start the flow capture on a fresh file, wait 5 minutes,
+#    read both counters again
+snmpget -Oqv $R 1.3.6.1.2.1.31.1.1.1.6.$B 1.3.6.1.2.1.31.1.1.1.10.$B
 sleep 300
-snmpget -v3 -l authPriv -u nad -a SHA -A 'CHANGE_ME' -x AES -X 'CHANGE_ME_TOO' <router-lan-ip> $OID
+snmpget -Oqv $R 1.3.6.1.2.1.31.1.1.1.6.$B 1.3.6.1.2.1.31.1.1.1.10.$B
+
+# 2) Over the same 5 minutes, sum flow bytes per direction
+F=~/nad-samples/flows-crosscheck.jsonl
+jq -s --argjson b $B 'map(select(.in_if == $b) | .bytes) | add' $F    # outbound
+jq -s --argjson b $B 'map(select(.out_if == $b) | .bytes) | add' $F   # inbound
 ```
 
-Compare **per direction**, because SNMP counts per interface while flows mix
-both directions. Bytes received on the LAN bridge match outbound flows; bytes
-received on the WAN interface match inbound flows. Use `in_if` to split them:
-
-```bash
-# 3) Over the same 5 minutes (start from a fresh file), sum flow bytes per
-#    ingress interface
-jq -s --argjson lan <lan-ifindex> 'map(select(.in_if == $lan) | .bytes) | add' ~/nad-samples/flows-crosscheck.jsonl
-jq -s --argjson wan <wan-ifindex> 'map(select(.in_if == $wan) | .bytes) | add' ~/nad-samples/flows-crosscheck.jsonl
-```
-
-Expect rough agreement, not equality. The bridge counter is slightly higher
-than outbound flows because it also counts traffic addressed to the router
-itself (DNS queries, management). A large gap points to one of the causes in
-section 12.
+Compare each SNMP difference with the matching flow total. Expect rough
+agreement, not equality: the bridge counters also include traffic to and from
+the router itself (DNS, management, the SNMP polling) and Ethernet framing,
+which flows do not count. Flow export also stops being comparable if the
+capture misses the first or last seconds. A large gap points to one of the
+causes in section 12.
 
 ## 10. Step 5 — Design the ingestor
 
@@ -432,7 +604,8 @@ rest:
 | Close a window only after a delay | Flow records arrive late (router timeouts); closing instantly would undercount |
 | Idempotent writes (upsert on the window key) | Re-running the ingestor must never duplicate rows |
 | Remember the read position per file | Resume after a stop without re-reading or skipping data |
-| Direction from `in_if`/`out_if`, not from addresses | The WAN address is dynamic (DHCP); interface indexes are stable |
+| Direction from `in_if`/`out_if`, not from addresses | The WAN address is dynamic (DHCP); interface indexes are more stable |
+| Interface indexes resolved from names at startup | Indexes can change when dynamic interfaces (VPN sessions) appear |
 | Per-host features from outbound flows only | Inbound flows carry the WAN address (recorded before reverse NAT) |
 | Address classes as configuration: internal (LAN, VPN), upstream (Starlink LAN), Internet | VPN traffic is internal company traffic; the Starlink LAN is neither internal nor Internet |
 | Keep only the needed fields at read time | Raw records are ~1.3 KB, mostly unused fields |
@@ -444,6 +617,11 @@ Fields used from goflow2 (v2.2.7): `time_flow_start_ns`, `time_flow_end_ns`,
 `in_if`, `out_if`, `tcp_flags`, `sampler_address`. Timestamps are in
 nanoseconds.
 
+SNMP values used: per-core CPU (`hrProcessorLoad`, OID 1.3.6.1.2.1.25.3.3.1.2),
+main memory (`hrStorageSize` and `hrStorageUsed`, index 65536 on this router),
+64-bit interface counters (`ifHCInOctets`, `ifHCOutOctets`), interface names
+(`ifName`).
+
 Example configuration (values from the reference network):
 
 ```yaml
@@ -452,8 +630,8 @@ internal_subnets:
   - 10.0.0.0/24       # WireGuard VPN (internal company traffic)
 upstream_subnets:
   - 192.168.1.0/24    # Starlink router LAN (neither internal nor Internet)
-lan_ifindex: <lan-ifindex>
-wan_ifindex: <wan-ifindex>
+lan_interface: bridge1   # resolved to its index (8 on 2026-10-16) at startup
+wan_interface: ether1    # resolved to its index (1, to confirm) at startup
 ```
 
 ### Draft schema (adjust after seeing real records)
@@ -471,7 +649,8 @@ CREATE TABLE IF NOT EXISTS windows (
   distinct_dests    INTEGER,
   distinct_ports    INTEGER,
   top_talker_share  REAL,                 -- from outbound flows
-  cpu_pct           REAL,
+  cpu_pct           REAL,                 -- mean of cores
+  cpu_core_max_pct  REAL,                 -- busiest core
   mem_pct           REAL,
   log_events        INTEGER,
   ingested_at       INTEGER
@@ -497,24 +676,30 @@ problem apart from a satellite link problem.
 Fill this in after each session. These values feed the decisions in
 `docs/tools/tooling.md`.
 
-| Item | Test session (safe mode) | Continuous collection |
-|---|---|---|
-| Date | 2026-10-15 | |
-| Router model | hAP ac² (RBD52G), 4 × ARM 672 MHz, 128 MB RAM | |
-| RouterOS version | 7.12 (stable) | |
-| Router free storage | ~0.4 MB of 15.2 MB | |
-| FastTrack enabled | No (no rule configured) | |
-| CPU load before telemetry | 10 % (22 min after a reboot) | |
-| CPU load with telemetry | 31 % (1 h later, not comparable yet) | |
-| Free memory before / with telemetry | 46.9 MB / 41.1 MB | |
-| Flow export interface choice | LAN bridge only: both directions, no double counting | |
-| Flows total vs SNMP counters (ratio) | Not measured yet | |
-| Flow field names noted | See step 5 | |
-| Addresses in flows | Outbound: internal hosts. Inbound: router WAN address | |
-| Syslog format observed | Not tested yet | |
-| Notes | Double NAT behind the Starlink router; WireGuard VPN on the router; LAN ports in hardware offload | |
+| Item | Flow test (2026-10-15) | SNMP setup (2026-10-16) | Continuous collection |
+|---|---|---|---|
+| Router model | hAP ac² (RBD52G-5HacD2HnD), 4 × ARM 672 MHz, 128 MB RAM | Confirmed by SNMP | |
+| RouterOS version | 7.12 (stable) | | |
+| Router uptime at measurement | 22 min, then 1 h 21 | 23 h 45 | |
+| Router free storage | ~0.4 MB of 15.2 MB | 0.32 MB (97.9 % used) | |
+| FastTrack enabled | No (no rule configured) | | |
+| CPU load, export off | 10 % (just after a reboot) | 8 % mean (cores 6/4/10/12), single reading | |
+| CPU load, export on | 31 % (not comparable) | | |
+| Free memory, export off | 46.9 MB (22 min uptime) | 36.6 MB (71.4 % used) | |
+| Free memory, export on | 41.1 MB | | |
+| Interface indexes | Flows: inbound `in_if` 1, outbound `in_if` 8 | `ether1`–`ether5` = 1–5, `wlan1`/`wlan2` = 6/7, `bridge1` = 8, then `wg-vpn`, `l2tp-vpn`, `ovpn-vpn` | |
+| WAN interface | `ether1` (carries the WAN address) | Index 1, to confirm with counters | |
+| LAN bridge counters | | In 8.7 GB, out 55.5 GB over 23 h 45 (≈ 0.8 Mbit/s up, 5.2 Mbit/s down) | |
+| Flow export interface choice | LAN bridge only: both directions, no double counting | | |
+| Flows total vs SNMP counters (ratio) | | Not measured yet | |
+| Addresses in flows | Outbound: internal hosts. Inbound: router WAN address | | |
+| SNMP setup | | v3 user `nad`, authPriv (SHA1/AES), restricted to the NAD host; `public` disabled; kept on the router | |
+| Syslog format observed | Not tested yet | | |
+| Notes | Double NAT behind the Starlink router; LAN ports in hardware offload | Hotspot active (dynamic `input` rules); no static `input` firewall rule; three VPN interfaces (WireGuard, L2TP, OpenVPN) | |
 
 ## 12. Troubleshooting
+
+### Flows
 
 | Symptom | Likely cause | What to check |
 |---|---|---|
@@ -524,28 +709,61 @@ Fill this in after each session. These values feed the decisions in
 | `template error` warnings in goflow2 | Template not received yet | Normal for the first seconds; restart goflow2 if it lasts more than 2 minutes |
 | "promiscuous mode not supported" warning | `tcpdump -i any` | Harmless; use the real interface |
 | goflow2 metrics unreachable on port 8080 | Port used by another service | `sudo ss -tlnp \| grep 8080`; start goflow2 with `-addr :9081` |
-| SNMP times out | Wrong credentials, address restriction, service disabled | `/snmp print`, community restriction matches the host address |
-| Syslog file empty | Port 514 blocked, wrong filter address, file permissions | `tcpdump` on UDP 514, `fromhost-ip` value, ownership of `/var/log/nad` |
 | Flow bytes much lower than SNMP | Accelerated forwarding or hardware offload, packet loss | FastTrack rule, bridge port flags, UDP drops on the host |
 | Flow bytes higher than SNMP | Same traffic exported from several interfaces | Export interface choice (`<lan-bridge>` versus `all`) |
+| Router CPU rises noticeably | Flow export load | Phases A/B/C (step 4.1); adjust timeouts or enable sampling |
+
+### SNMP
+
+| Symptom | Likely cause | What to check |
+|---|---|---|
+| `Timeout: No Response from <ip>` | Service disabled, wrong address in the community, `input` firewall rule | `/snmp print`; `addresses=` equals the host IP; `input` chain |
+| `Unknown user name` | Community name differs from `defSecurityName` | `/snmp community print`; `~/.snmp/snmp.conf` |
+| `Authentication failure` | Different `AUTH` passphrase or algorithm (SHA1 versus another) | Same value and algorithm on both sides |
+| `Decryption error` | Different `PRIV` passphrase or cipher | Same value on both sides |
+| `No Such Object available` | OID not exposed by the router | `snmpwalk` the parent branch |
+| A counter does not change | Wrong interface index | Repeat test 2 |
+| "Unknown Object Identifier" warning | Names used without MIB files | Use numeric OIDs |
+| `command not found` | Client tools not installed | `sudo pacman -S --needed net-snmp` |
+
+### Other
+
+| Symptom | Likely cause | What to check |
+|---|---|---|
+| Syslog file empty | Port 514 blocked, wrong filter address, file permissions | `tcpdump` on UDP 514, `fromhost-ip` value, ownership of `/var/log/nad` |
 | Windows misaligned between sources | Router clock not synchronized | `/system ntp client print` |
-| Router CPU rises noticeably | Flow export load | `/tool profile duration=10s`; adjust timeouts or enable sampling |
-| Configuration gone after closing SSH | Session closed while still in safe mode | Expected during tests; `Ctrl+X` keeps changes when you want them permanent |
+| Configuration gone after closing SSH | Session closed while still in safe mode | Expected for tests; `Ctrl+X` keeps changes when you want them permanent |
 
 ## 13. Next steps
 
-1. Test SNMP (step 1.2), then the cross-check (step 4).
-2. Telegraf configuration for SNMP and probes (guide 02).
-3. Ingestor skeleton under `src/nad/collect`, with adapters and tests on the
+1. Confirm the WAN interface index with its counters.
+2. Router load, phases A/B/C (step 4.1).
+3. Cross-check flows against the LAN bridge counters (step 4.2).
+4. Syslog (step 1.3).
+5. Telegraf configuration for SNMP and probes, with index-to-name resolution
+   (guide 02).
+6. Ingestor skeleton under `src/nad/collect`, with adapters and tests on the
    captured samples.
-4. Ansible roles that install and configure the receivers on the NAD host, so
-   this guide's manual steps become repeatable.
+7. Ansible roles that install and configure the receivers on the NAD host.
+
+Later hardening, outside this guide: a static `input` firewall rule that only
+accepts UDP 161 from the NAD host. Not now: the router runs a Hotspot, and
+changing a production gateway's firewall is a separate project.
 
 ## Glossary
 
 - **Flow:** a summary of one conversation between two machines (addresses,
   ports, bytes, packets).
 - **SNMP:** a standard protocol to ask a device for its counters and status.
+- **Community (SNMP v1/v2c):** a shared password sent in clear text with every
+  request. `public` is the universal default.
+- **SNMPv3 user:** an account with authentication and, at `authPriv` level,
+  encryption. In RouterOS it is an entry of `/snmp community` with
+  `security=private`.
+- **OID:** the numeric address of a value in SNMP, such as
+  `1.3.6.1.2.1.1.3.0` for the uptime.
+- **MIB:** a catalogue that gives names to OIDs. Numeric OIDs work without it.
+- **ifIndex:** the number SNMP and flow records use to identify an interface.
 - **Syslog:** a standard protocol for devices to send event messages.
 - **Window:** a fixed slice of time (one minute) into which all events are
   grouped.
@@ -558,6 +776,8 @@ Fill this in after each session. These values feed the decisions in
 - **Bridge:** a virtual switch grouping several ports into one LAN interface.
 - **Hardware offload:** traffic switched by the switch chip without reaching the
   CPU; it does not appear in flow export.
+- **Hotspot:** a MikroTik feature for guest access with a login page; it adds
+  dynamic firewall rules.
 - **Template (NetFlow v9):** a message describing the field layout; data
   records cannot be decoded before it arrives.
 - **Safe mode:** a RouterOS session mode where changes are undone unless you
