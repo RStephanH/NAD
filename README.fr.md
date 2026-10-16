@@ -171,6 +171,7 @@ src/nad/        Code applicatif : collect, features, model, detect
 scenarios/      Anomalies injectées avec leurs étiquettes attendues
 data/           Local uniquement (ignoré par Git) + petits échantillons anonymisés
 docs/           Architecture, outils, rapport
+  concepts/     Explications des notions clés (qu'est-ce qu'une anomalie)
   diagrams/     Sources PlantUML (.puml) et images générées (.png, .svg)
   tools/        Comparatifs d'outils et choix technologiques
   guides/       Guides pas à pas (mise en place, justification, commandes)

@@ -157,6 +157,7 @@ src/nad/        Application code: collect, features, model, detect
 scenarios/      Injected anomalies with expected labels
 data/           Local only (git-ignored) plus small anonymized samples
 docs/           Architecture, tooling, report
+  concepts/     Explanations of key notions (what is an anomaly)
   diagrams/     PlantUML sources (.puml) and generated images (.png, .svg)
   tools/        Tool comparisons and technology choices
   guides/       Step-by-step workflow guides (setup, rationale, commands)
