@@ -15,9 +15,9 @@ the target environment and must be checked against current documentation.
 | Item | Value |
 |---|---|
 | Goal | Detect abnormal network behavior automatically (unsupervised) |
-| Reference environment | Small company network, MikroTik gateway (hAP ax class), Starlink uplink |
+| Reference environment | Small company network, MikroTik gateway (hAP ac², RouterOS 7), Starlink uplink |
 | Network size | Small; exact numbers of users and devices to be confirmed on site |
-| Prototype hardware | A hAP ax used for prototyping before the real site is accessible |
+| Prototype hardware | A hAP ac² used for prototyping before the real site is accessible |
 | Placement | NAD runs on a separate Linux host, never in the traffic path |
 | Operator profile | One engineer; comfortable with Linux, Python, Go; CLI-first |
 | Hard rule | Read-only on production devices: telemetry export only |

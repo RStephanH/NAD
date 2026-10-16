@@ -17,9 +17,9 @@ actuelle.
 | Élément | Valeur |
 |---|---|
 | Objectif | Détecter automatiquement les comportements réseau anormaux (non supervisé) |
-| Environnement de référence | Petit réseau d'entreprise, passerelle MikroTik (classe hAP ax), liaison montante Starlink |
+| Environnement de référence | Petit réseau d'entreprise, passerelle MikroTik (hAP ac², RouterOS 7), liaison montante Starlink |
 | Taille du réseau | Petite ; nombres exacts d'utilisateurs et d'appareils à confirmer sur place |
-| Matériel de prototypage | Un hAP ax utilisé pour prototyper avant d'accéder au site réel |
+| Matériel de prototypage | Un hAP ac² utilisé pour prototyper avant d'accéder au site réel |
 | Emplacement | NAD tourne sur un hôte Linux séparé, jamais dans le chemin du trafic |
 | Profil de l'opérateur | Un ingénieur ; à l'aise avec Linux, Python, Go ; privilégie la ligne de commande |
 | Règle absolue | Lecture seule sur les équipements de production : export de télémétrie uniquement |
