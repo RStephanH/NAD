@@ -24,10 +24,10 @@ data and reports what deviates from it.
 
 ## Reference environment
 
-A small company network (about 80 users) behind a MikroTik hAP ac² gateway
-(RouterOS 7), itself behind the Starlink router (double NAT). The gateway
-exports telemetry; NAD runs on a separate Linux host and never sits in the
-traffic path.
+A company network of about thirty users. The main router is a MikroTik
+RB1100AHx4 connected to the Starlink uplink (double NAT); all switches and
+other routers connect downstream of it. The router exports telemetry; NAD runs
+on a separate Linux host and never sits in the traffic path.
 
 ## Architecture
 
@@ -43,7 +43,27 @@ traffic path.
 | Detector | Feature building, scoring, baseline | Python, scikit-learn |
 | Dashboard | Statistics and highlighted anomalies | Streamlit |
 | Alert hook | Optional notification on new anomalies | Webhook |
+| Transport | Carries telemetry to the NAD host when it is not on the local network | WireGuard (optional) |
 | Deployment | Configures the host reproducibly | Ansible + systemd |
+
+### Deployment topologies
+
+The router reaches the NAD host in one of two ways. The pipeline is the same in
+both; only the path of the telemetry changes.
+
+| Topology | How it works | Best when |
+|---|---|---|
+| **Local machine** | A Linux machine on the local network hosts NAD and receives telemetry directly from the router | The site can host a machine; simplest and no data leaves the site |
+| **VPN (WireGuard)** | The NAD host is remote (for example a VPS). A machine or the router on the site opens a WireGuard tunnel to it, and telemetry travels inside the tunnel | No machine on site for NAD, or NAD should be reachable from outside |
+
+Notes:
+
+- The tunnel is always opened from the site toward the remote host, so it works
+  behind NAT. Native WireGuard on the router needs RouterOS 7; otherwise a small
+  Linux machine on the local network carries the tunnel and the router exports
+  telemetry to it locally.
+- ICMP probes should run from a machine on the monitored network. A remote NAD
+  host would measure its own link, not the company's.
 
 ## Specification
 
@@ -98,7 +118,10 @@ table of anomaly events.
   firewall changes.
 - Runs on a single modest Linux host.
 - Deployment is automated and repeatable.
-- No credentials in the repository; configuration through environment files.
+- No credentials or keys in the repository; configuration through environment
+  files.
+- Telemetry that leaves the site is encrypted (WireGuard), and NAD services
+  listen only on internal or tunnel addresses, never on a public address.
 - Raw data never leaves the host; shared data is anonymized.
 
 ## Technology decisions
@@ -111,6 +134,7 @@ table of anomaly events.
 | Store | SQLite + Parquet | One file, no administration, Parquet is ML-friendly | TimescaleDB or VictoriaMetrics; ClickHouse for large flow volumes |
 | Detector | Isolation Forest + seasonal baseline | Few assumptions, explainable, handles many features | Add LOF or One-Class SVM as comparisons |
 | Dashboard | Streamlit | Full control over anomaly rendering, pure Python | Grafana + Alertmanager |
+| Transport | WireGuard, remote host as rendezvous point (or plain local network) | Few moving parts, native on RouterOS 7, one UDP port | Tailscale or Headscale for many devices |
 | Deployment | Ansible + systemd | One host, no container layer to maintain | Docker Compose on a server |
 
 The full comparison of candidate tools, with strengths and limits, is in
@@ -144,7 +168,7 @@ gracefully when a source is unavailable:
 |---|---|
 | Detection and reporting | Automatic blocking or remediation |
 | Metadata (counters, flows, latency) | Packet payload inspection |
-| One site, one gateway | Multi-site correlation |
+| One site, one main router | Multi-site correlation |
 
 ## Repository layout
 
@@ -152,7 +176,7 @@ gracefully when a source is unavailable:
 README.md       Documentation (English)
 README.fr.md    Documentation (French)
 Makefile        Shortcuts (make diagrams)
-infra/          Deployment automation (Ansible) and optional lab (Terraform)
+infra/          Deployment automation (Ansible); optional lab (Terraform, deferred)
 src/nad/        Application code: collect, features, model, detect
 scenarios/      Injected anomalies with expected labels
 data/           Local only (git-ignored) plus small anonymized samples
@@ -173,17 +197,19 @@ detection rate and false alarms per day.
 
 Flow data is metadata about real people's activity. Raw data stays out of Git,
 and any shared dataset is anonymized (addresses, hostnames) first. Telemetry
-export on the router is restricted to the NAD host, using a dedicated
-read-only account.
+export on the router is restricted to the NAD host (or to the tunnel address),
+using a dedicated read-only account. WireGuard keys are generated per device,
+never reused, and never committed.
 
 ## Roadmap
 
-- [ ] Telemetry enabled on the gateway
+- [ ] Telemetry enabled on the main router
+- [ ] Secure transport to the NAD host (WireGuard tunnel, or machine on the local network)
 - [ ] Collection running on the NAD host
 - [ ] Ingestion into normalized windows
 - [ ] Detector and baseline
 - [ ] Validation with injected anomalies
 - [ ] Dashboard
 - [ ] Ansible deployment
-- [ ] Lab automation (optional)
+- [ ] Lab automation (optional, deferred)
 - [ ] Uplink dish status as an additional source (optional)

@@ -10,12 +10,13 @@ Person(admin, "Administrateur réseau", "Consulte le tableau de bord et les aler
 
 System_Boundary(site, "Réseau de l'entreprise") {
   System_Ext(users, "Utilisateurs", "Postes de travail et téléphones")
-  System_Ext(gateway, "MikroTik hAP ac²", "Passerelle (RouterOS 7), NAT, exporte Traffic-Flow, SNMP, syslog")
+  System_Ext(lan, "Switchs et routeurs", "Équipements en aval, tous connectés au routeur principal")
+  System_Ext(gateway, "MikroTik RB1100AHx4", "Routeur principal (RouterOS), NAT, exporte Traffic-Flow, SNMP, syslog")
   System_Ext(slrouter, "Routeur Starlink", "Second NAT, premier saut vers la liaison montante")
   System_Ext(uplink, "Starlink", "Liaison montante satellite")
 }
 
-System_Boundary(nad, "Hôte NAD (Linux, systemd)") {
+System_Boundary(nad, "Hôte NAD (Linux, systemd), sur le réseau local ou distant via WireGuard") {
   Container(telegraf, "Telegraf", "SNMP + ICMP", "Interroge les compteurs du routeur, mesure latence et perte")
   Container(goflow, "goflow2", "NetFlow v9/IPFIX", "Décode les flux en JSON")
   Container(rsyslog, "rsyslog", "Récepteur syslog", "Stocke les journaux du routeur")
@@ -26,15 +27,16 @@ System_Boundary(nad, "Hôte NAD (Linux, systemd)") {
   Container(alerts, "Alerte", "Webhook, optionnel", "Notifie les nouveaux événements d'anomalie")
 }
 
-Rel(users, gateway, "Trafic")
+Rel(users, lan, "Trafic")
+Rel(lan, gateway, "Trafic")
 Rel(gateway, slrouter, "Trafic")
 Rel(slrouter, uplink, "Trafic")
 
-Rel(telegraf, gateway, "Interrogation SNMP")
+Rel(telegraf, gateway, "Interrogation SNMP", "Réseau local ou WireGuard")
 Rel(telegraf, slrouter, "Sondes ICMP (premier saut)")
 Rel(telegraf, uplink, "Sondes ICMP (cibles Internet)")
-Rel(gateway, goflow, "Traffic-Flow", "UDP 2055")
-Rel(gateway, rsyslog, "Syslog", "UDP 514")
+Rel(gateway, goflow, "Traffic-Flow", "UDP 2055, réseau local ou WireGuard")
+Rel(gateway, rsyslog, "Syslog", "UDP 514, réseau local ou WireGuard")
 
 Rel(telegraf, ingest, "Lignes JSON")
 Rel(goflow, ingest, "Lignes JSON")

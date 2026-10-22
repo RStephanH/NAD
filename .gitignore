@@ -1,0 +1,4 @@
+infra/.venv/
+infra/inventory/group_vars/routers/vault.yml
+*.retry
+.obsidian

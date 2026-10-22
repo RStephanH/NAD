@@ -12,15 +12,21 @@ connu. Les éléments marqués **(à vérifier)** dépendent des versions des ou
 ou de l'environnement cible et doivent être contrôlés dans la documentation
 actuelle.
 
+**Dernière mise à jour :** 2026-10-19 — ajout du transport de télémétrie par
+WireGuard (D12) ; Terraform/OpenTofu (D10) marqué comme reporté ; routeur
+principal (RB1100AHx4) et taille du réseau (une trentaine d'utilisateurs)
+renseignés.
+
 ## 1. Contexte
 
 | Élément | Valeur |
 |---|---|
 | Objectif | Détecter automatiquement les comportements réseau anormaux (non supervisé) |
-| Environnement de référence | Petit réseau d'entreprise, passerelle MikroTik (hAP ac², RouterOS 7), liaison montante Starlink |
-| Taille du réseau | Petite ; nombres exacts d'utilisateurs et d'appareils à confirmer sur place |
-| Matériel de prototypage | Un hAP ac² utilisé pour prototyper avant d'accéder au site réel |
+| Environnement de référence | Réseau d'entreprise, routeur principal MikroTik RouterBOARD RB1100AHx4 (version de RouterOS à confirmer) connecté à la liaison Starlink ; les autres switchs et routeurs se branchent en aval |
+| Taille du réseau | Environ trente utilisateurs ; nombre d'appareils (probablement supérieur) à confirmer sur place |
+| Accès au routeur | Le routeur principal n'est pas encore accessible pour les essais ; un laptop joue provisoirement le rôle du routeur dans le tunnel |
 | Emplacement | NAD tourne sur un hôte Linux séparé, jamais dans le chemin du trafic |
+| Transport de la télémétrie | Tunnel WireGuard sortant depuis le réseau de l'entreprise vers un hôte distant à adresse publique (voir 4.12), ou une machine du réseau local |
 | Profil de l'opérateur | Un ingénieur ; à l'aise avec Linux, Python, Go ; privilégie la ligne de commande |
 | Règle absolue | Lecture seule sur les équipements de production : export de télémétrie uniquement |
 
@@ -55,8 +61,9 @@ Chaque candidat est jugé avec les mêmes questions :
 | D7 | Tableau de bord | Streamlit | Grafana |
 | D8 | Alertes | Webhook optionnel depuis le détecteur | Grafana / Alertmanager |
 | D9 | Déploiement | Ansible + systemd | Docker Compose |
-| D10 | Provisionnement du labo (optionnel) | Terraform ou OpenTofu + libvirt | Ansible `community.libvirt` |
+| D10 | Provisionnement du labo (optionnel, **reporté**) | Terraform ou OpenTofu + libvirt | Ansible `community.libvirt` |
 | D11 | État de la liaison montante (optionnel) | Outils gRPC de la parabole Starlink | aucun |
+| D12 | Transport de la télémétrie | WireGuard, hôte distant comme point de rencontre | Tailscale / Headscale |
 
 ---
 
@@ -96,7 +103,10 @@ de flux est lu par l'ingesteur Python et agrégé en fenêtres temporelles.
 internes ou les adresses traduites (NAT). L'attribution par utilisateur en
 dépend. Vérifier aussi si l'accélération du routage (par exemple FastTrack sur
 MikroTik) masque une partie du trafic à l'export de flux, et si l'export de flux
-augmente sensiblement le CPU du routeur.
+augmente sensiblement le CPU du routeur. Sur le RB1100AHx4, vérifier aussi quels
+ports sont en commutation matérielle (offload du pont) : le trafic commuté
+uniquement entre ports d'un même pont peut ne jamais passer par le CPU et donc
+ne pas apparaître dans les flux **(à vérifier)**.
 
 ### 4.2 Métriques de l'équipement via SNMP (D2)
 
@@ -120,7 +130,8 @@ un **complément optionnel** pour associer IP et machine (baux DHCP).
 
 **Notes de sécurité :** utiliser SNMPv3 si l'équipement le permet, sinon
 restreindre la communauté à l'adresse de l'hôte NAD ; utiliser un compte en
-lecture seule.
+lecture seule. Avec le tunnel WireGuard (D12), l'interrogation SNMP circule
+dans le tunnel chiffré, vers l'adresse du routeur dans le tunnel.
 
 **À réévaluer si :** l'entreprise a déjà un système de supervision basé sur
 SNMP. Récupérer ses données plutôt que d'interroger deux fois.
@@ -142,6 +153,16 @@ directe de la santé de la liaison montante.
 suivant, et deux ou trois destinations publiques) pour distinguer un problème
 local d'un problème en amont. Ajouter des sondes DNS et HTTP plus tard si des
 métriques d'expérience utilisateur sont nécessaires.
+
+**Attention :** des sondes lancées depuis un hôte distant mesureraient la
+liaison de cet hôte, pas celle du réseau de l'entreprise. Elles doivent partir
+d'un hôte situé côté réseau surveillé, ou viser le routeur à travers le tunnel
+(ce qui mesure alors aussi le tunnel lui-même).
+
+**Précaution Linux :** sur un VPS minimal, la commande `ping` peut manquer de la
+permission d'ouvrir des sockets bruts (`cap_net_raw`). Réparer avec
+`sudo apt install --reinstall iputils-ping`, ou `setcap cap_net_raw+p` sur le
+binaire. Le service Telegraf a besoin du même droit.
 
 ### 4.4 Journaux (D4)
 
@@ -217,15 +238,17 @@ caractéristiques de qualité de liaison séparées et les juger par rapport à 
 propre référence, pour que la variation normale de la liaison ne soit pas
 signalée comme un comportement anormal interne.
 
-**Comportement des petits réseaux :** sur un réseau comptant peu d'appareils, un
-seul appareil peut dominer le trafic, si bien que les pics normaux paraissent
+**Comportement d'un réseau de taille modeste (une trentaine d'utilisateurs) :**
+quelques appareils (téléchargements, mises à jour, visioconférences) peuvent
+encore dominer le trafic d'une minute, si bien que des pics normaux paraissent
 importants. Privilégier des statistiques robustes (médiane et MAD plutôt que
 moyenne et écart-type), envisager des fenêtres plus larges (par exemple 5
 minutes) pour lisser les pics courts, et commencer avec des seuils tolérants en
-les resserrant selon le taux de fausses alertes observé. Les caractéristiques de
-diversité (hôtes distincts) apportent moins de signal ici, tandis que des
-profils par appareil deviennent envisageables et pourront être ajoutés plus
-tard.
+les resserrant selon le taux de fausses alertes observé. À cette échelle, les
+caractéristiques de diversité (hôtes distincts, destinations distinctes) ont
+un signal modeste mais exploitable, et des profils par appareil restent
+envisageables une fois assez d'historique accumulé ; ils pourront être ajoutés
+plus tard.
 
 **À réévaluer si :** l'historique est assez long pour des méthodes à base de
 prévision, ou si les cases saisonnières sont trop peu remplies (repasser à des
@@ -244,6 +267,8 @@ cases plus grossières).
 **Décision D7 : Streamlit.** La vue des anomalies est une logique sur mesure,
 plus simple à écrire en Python. Streamlit n'a pas d'authentification propre : le
 lier à une interface interne, ou le placer derrière un reverse proxy ou un VPN.
+Sur un VPS à adresse publique, ne jamais l'exposer sur l'adresse publique : le
+lier à l'adresse du tunnel WireGuard (D12) ou à `127.0.0.1` avec un tunnel SSH.
 
 ### 4.8 Alertes (D8)
 
@@ -272,9 +297,16 @@ de l'entreprise.
 **Décision D9 : Ansible avec des services systemd.** Les mêmes rôles doivent
 fonctionner pour l'hôte du labo et pour un hôte réel ; ils ne doivent donc pas
 supposer comment l'hôte a été créé. Garder un inventaire par environnement et
-les secrets hors de Git (Ansible Vault ou fichiers d'environnement).
+les secrets hors de Git (Ansible Vault ou fichiers d'environnement). La
+configuration WireGuard (clés, fichier de configuration, pare-feu) est une bonne
+candidate pour un rôle Ansible dédié une fois la procédure manuelle validée.
 
-### 4.10 Provisionnement du labo, optionnel (D10)
+### 4.10 Provisionnement du labo, optionnel et reporté (D10)
+
+**Statut : reporté.** Terraform (ou OpenTofu) n'est pas utilisé dans le projet à
+ce jour. Il est prévu pour le dépôt, mais n'est pas urgent. L'infrastructure
+actuelle (VPS, tunnel WireGuard, labo) est mise en place à la main puis
+documentée ; Ansible (D9) passe en premier.
 
 Le labo recrée la pile dans des machines virtuelles pour la tester sans toucher
 au réseau réel. Il n'est pas nécessaire en production.
@@ -289,8 +321,13 @@ au réseau réel. Il n'est pas nécessaire en production.
 | Incus / LXD | Conteneurs système, légers et rapides | Labos à faibles ressources | Pas de vraies VM |
 | Images de routeurs virtuels (par exemple RouterOS CHR) | Tester l'automatisation d'un routeur sans risque | Tu as besoin d'un routeur sans toucher au matériel | Image x86 ; pas de Wi-Fi ni certaines fonctions matérielles |
 
-**Décision D10 : Terraform ou OpenTofu avec libvirt, optionnel.** À traiter
-comme un confort de labo, jamais comme une dépendance du produit.
+**Décision D10 : Terraform ou OpenTofu avec libvirt, optionnel, reporté.** À
+traiter comme un confort de labo, jamais comme une dépendance du produit.
+
+**À réexaminer quand :** les rôles Ansible sont stables et on veut rendre le
+labo reproductible depuis le dépôt (utile aussi pour la démonstration). Si le
+VPS lui-même doit un jour être décrit en code, vérifier d'abord si l'hébergeur
+dispose d'un provider Terraform maintenu **(à vérifier)**.
 
 ### 4.11 État de la liaison montante, optionnel (D11)
 
@@ -300,6 +337,78 @@ comme un confort de labo, jamais comme une dépendance du produit.
 
 **Décision D11 :** une source supplémentaire optionnelle derrière un adaptateur
 de collecte. Elle ne doit pas se trouver sur le chemin critique.
+
+### 4.12 Transport de la télémétrie (D12)
+
+**En termes simples :** le routeur est derrière la parabole Starlink et un
+second niveau de traduction d'adresses (NAT). Personne depuis Internet ne peut
+« frapper à sa porte », mais lui peut appeler vers l'extérieur. On place donc un
+point de rencontre à adresse publique fixe (un VPS). Le routeur l'appelle et
+garde la ligne ouverte. Cette ligne est un tunnel chiffré : la télémétrie
+(flux, SNMP, journaux) y circule, et le VPS peut aussi atteindre le routeur par
+ce même canal. Quand NAD tourne sur une machine du réseau local, aucun tunnel
+n'est nécessaire : le routeur lui exporte simplement sa télémétrie en local.
+
+Chaque appareil possède une paire de clés (privée, qui ne quitte jamais
+l'appareil, et publique, donnée à l'autre extrémité) ainsi qu'une adresse dans un
+petit réseau privé qui n'existe que dans le tunnel.
+
+| Outil | Spécialité | Convient quand | Limites |
+|---|---|---|---|
+| **WireGuard, VPS en point de rencontre** | Dans le noyau Linux et natif dans RouterOS 7 ; configuration courte ; un seul port UDP ; silencieux face à tout paquet qu'il ne reconnaît pas | Peu d'appareils, besoin d'un chemin chiffré et simple à expliquer | Gestion manuelle des clés ; pas de découverte automatique ; le port UDP doit être ouvert à tous les niveaux (voir ci-dessous) |
+| Tailscale / Headscale | Gestion des clés et traversée de NAT automatiques | Beaucoup d'appareils, ou besoin d'ACL fines | Dépend d'un service de coordination (ou d'un Headscale à héberger) ; pas de client natif sur RouterOS **(à vérifier)** |
+| IPsec / IKEv2 | Standard, natif sur RouterOS | L'entreprise impose IPsec | Configuration plus complexe, diagnostic plus difficile |
+| OpenVPN | Très répandu | Compatibilité avec un parc existant | Plus lourd ; support RouterOS limité **(à vérifier)** |
+| Tunnel SSH inversé | Très simple, aucun VPN | Un seul flux TCP ponctuel | NetFlow, SNMP et syslog sont en UDP : mal adapté |
+| Cloudflare Tunnel | Exposition de services web sans port ouvert | Services HTTP/TCP | Orienté HTTP/TCP ; mal adapté aux flux UDP de télémétrie **(à vérifier)** |
+
+**Décision D12 : WireGuard, avec le VPS comme point de rencontre.** C'est la
+solution qui a le moins de pièces mobiles, qui fonctionne des deux côtés sans
+logiciel supplémentaire et qui reste sous le contrôle de l'équipe.
+
+**Plan d'adressage du tunnel :**
+
+| Rôle | Adresse dans le tunnel |
+|---|---|
+| VPS (écoute sur UDP 51820) | `10.100.0.1/24` |
+| MikroTik (cible finale) | `10.100.0.2` |
+| Laptop (remplaçant provisoire du routeur) | `10.100.0.3` |
+
+**Principes de configuration :**
+
+- Le pair situé derrière le NAT (routeur ou laptop) appelle le VPS en premier et
+  envoie un paquet de maintien toutes les 25 secondes (`PersistentKeepalive`) :
+  c'est ce qui garde le « trou » ouvert dans les NAT.
+- Chaque pair a ses propres clés et une `AllowedIPs` limitée à son adresse
+  (`/32`) côté VPS. Côté pair, `AllowedIPs` se limite à l'adresse du VPS
+  (`/32`) : seul le trafic de NAD passe dans le tunnel, pas tout Internet.
+- Les clés privées et les fichiers de configuration ne vont jamais dans le dépôt
+  (`.gitignore`) ; seule la procédure est documentée.
+- Les services de NAD (collecteur de flux, récepteur syslog, tableau de bord)
+  écoutent sur l'adresse du tunnel, jamais sur `0.0.0.0`, pour ne pas être
+  exposés sur l'adresse publique du VPS.
+- Côté RouterOS, le pare-feu par défaut rejette ce qui n'arrive pas du LAN : une
+  règle `input` autorisant l'interface WireGuard doit être placée **avant** la
+  règle de rejet. Utiliser le Safe Mode lors de la modification à distance.
+- Le port UDP doit être ouvert à **deux niveaux indépendants** : le pare-feu de
+  l'hôte (par exemple `ufw`) **et** le pare-feu du fournisseur de VPS dans son
+  panneau web. C'était la cause de la première panne du prototype : la
+  configuration WireGuard était correcte, mais le pare-feu du fournisseur
+  bloquait l'UDP entrant.
+
+**Prérequis côté routeur :** WireGuard n'existe que dans RouterOS 7. La version
+installée sur le RB1100AHx4 doit être confirmée. Si c'est RouterOS 6, deux
+voies : une mise à jour majeure du routeur (modification de production, à
+faire valider et à planifier avec sauvegarde de la configuration), ou un
+montage qui ne touche pas au routeur : un petit hôte Linux sur le LAN (le
+futur hôte NAD) porte le tunnel WireGuard vers le VPS, et le routeur lui
+exporte sa télémétrie en local. Ce second montage respecte mieux la règle de
+lecture seule, au prix d'un hôte supplémentaire à maintenir sur le site.
+
+**À réévaluer si :** le nombre d'appareils dépasse quelques unités, la rotation
+des clés devient une contrainte, ou l'entreprise utilise déjà Tailscale ou un
+autre VPN : dans ce cas, réutiliser l'existant plutôt que de maintenir un second
+système.
 
 ---
 
@@ -311,6 +420,7 @@ le stockage et le tableau de bord.
 
 | Composant | A. Minimal (prototype actuel) | B. Routeur puissant + serveur | C. Supervision existante | D. Accès restreint |
 |---|---|---|---|---|
+| Transport | WireGuard, VPS en point de rencontre | Réseau local, ou WireGuard si site distant | Réseau et VPN existants | Selon la politique de l'entreprise |
 | Flux | goflow2 | goflow2, plus port miroir et Zeek si disponibles | goflow2 ou réutiliser l'outil de flux de l'entreprise | Capture passive sur port miroir, ou aucune |
 | Métriques de l'équipement | Telegraf SNMP | Prometheus + snmp_exporter, ou Telegraf | Récupérer depuis le système existant (API ou base) | SNMP seulement si autorisé |
 | Sondes | Telegraf | Telegraf ou blackbox_exporter | Réutiliser les sondes existantes si comparables | Telegraf (aucun accès au routeur nécessaire) |
@@ -324,6 +434,8 @@ le stockage et le tableau de bord.
 
 | Condition | Comment la repérer | Repli | Ce qui est perdu |
 |---|---|---|---|
+| Tunnel WireGuard sans handshake | `wg show` n'affiche aucun `latest handshake` ; `0 B received` côté pair | Vérifier dans l'ordre : pare-feu du fournisseur, pare-feu de l'hôte, IP de l'endpoint, clés publiques des deux côtés ; `tcpdump -ni any udp port 51820` sur le VPS montre si les paquets arrivent | Toute la télémétrie tant que le tunnel est coupé |
+| Handshake établi mais pas de ping | Handshake récent, mais aucune réponse | Vérifier `AllowedIPs` des deux côtés et la règle `input` du routeur (ordre) | Accès du VPS au routeur |
 | Export de flux indisponible ou incomplet | Aucun paquet de flux n'arrive, ou les compteurs divergent du SNMP | Compteurs SNMP et sondes uniquement | Attribution aux hôtes et aux destinations |
 | SNMP bloqué | L'interrogateur renvoie des délais dépassés | Flux plus sondes ; API du constructeur si autorisée | Métriques d'interfaces et de CPU |
 | Export syslog non autorisé | Aucun événement de journal | Abandonner les caractéristiques de journaux | Contexte des événements de l'équipement |
@@ -339,23 +451,26 @@ Elles décident quel profil de la section 5 s'applique.
 
 | Question | Pourquoi c'est important | Influence |
 |---|---|---|
-| Modèle du routeur et version de RouterOS ? | Fonctions de télémétrie et marge de CPU | D1, D2 |
+| Version de RouterOS du RB1100AHx4 (le modèle est connu) ? | WireGuard n'existe que dans RouterOS 7 ; fonctions de télémétrie disponibles | D1, D2, D12 |
 | L'accélération du routage (FastTrack) est-elle activée ? | Peut masquer du trafic à l'export de flux | D1 |
 | Les flux exportés montrent-ils les adresses internes ou traduites (NAT) ? | Attribution par utilisateur | D1, caractéristiques |
-| Combien d'appareils sont connectés, et lesquels sont partagés ou non gérés ? | Taille des fenêtres, seuils et utilité des caractéristiques de diversité | D6, caractéristiques |
+| Combien d'appareils pour la trentaine d'utilisateurs, et lesquels sont partagés ou non gérés ? | Taille des fenêtres, seuils et utilité des caractéristiques de diversité | D6, caractéristiques |
 | Existe-t-il un commutateur administrable avec port miroir ? | La capture passive et Zeek deviennent possibles | Modes dégradés, profils B/D |
 | Quel matériel serveur est disponible, et supporte-t-il la virtualisation ? | Conteneurs, labo, stockage plus lourd | D9, D10, profil B |
 | Une supervision ou une gestion de journaux existe-t-elle déjà ? | Réutiliser plutôt que dupliquer | Profil C |
 | Règles de rétention et de confidentialité pour les données de flux ? | Ce qui peut être stocké et pour combien de temps | D5, section 6 |
 | Où tournent le DHCP, le DNS et le Wi-Fi ? | Associer les IP aux utilisateurs et aux appareils | API RouterOS optionnelle, caractéristiques |
 | L'adresse de gestion de la parabole est-elle joignable depuis le LAN ? | Source optionnelle de la liaison montante | D11 |
+| L'entreprise autorise-t-elle un tunnel sortant vers un serveur externe, et la télémétrie peut-elle quitter le site ? | Le transport par VPS suppose que les flux sortent du réseau | D12, section 6 |
 | Qui autorise les tests d'injection d'anomalies, et quand ? | La validation nécessite une fenêtre | Plan de validation |
 
-## 8. Vérifications à faire dès maintenant sur le routeur de prototypage
+## 8. Vérifications à faire dès maintenant
+
+### 8.1 Sur le routeur (lecture seule)
 
 Avant d'écrire du code, confirmer la chaîne de télémétrie de bout en bout sur le
-matériel de prototypage. Ce sont des vérifications en lecture seule sur le
-routeur :
+routeur, dès que l'accès est possible. Ce sont des vérifications en lecture
+seule sur le routeur :
 
 ```
 /system resource print
@@ -377,10 +492,32 @@ snmpwalk -v2c -c <community> <router-ip> 1.3.6.1.2.1.2.2.1.10
 sudo tcpdump -ni any udp port 514
 ```
 
-Noter le modèle du routeur, la version de RouterOS, la charge CPU avec et sans
-export activé, et si les octets comptés par les flux correspondent à peu près
-aux compteurs d'interface SNMP. Ces résultats alimentent directement les
-décisions D1 et D2 ainsi que les questions à poser sur place ci-dessus.
+Noter la version de RouterOS, la charge CPU avec et sans export activé, et si
+les octets comptés par les flux correspondent à peu près aux compteurs
+d'interface SNMP. Ces résultats alimentent directement les décisions D1 et D2
+ainsi que les questions à poser sur place ci-dessus.
+
+### 8.2 Le tunnel WireGuard
+
+```bash
+# On the VPS: peer should show an endpoint, a recent handshake and traffic
+sudo wg show
+
+# Does the stand-in peer (or the router) answer through the tunnel?
+sudo ping -c3 10.100.0.3
+
+# Do telemetry-like packets arrive on the tunnel interface?
+sudo tcpdump -ni wg0 udp port 2055
+
+# From the peer side, send a test packet through the tunnel
+echo "test" | nc -u -w1 10.100.0.1 2055
+```
+
+Si `ping` échoue avec « Opération non permise » (`cap_net_raw`), ce n'est pas un
+problème de tunnel : réparer les permissions de `ping` (voir 4.3). Un
+`Destination Host Unreachable` avec `Adresse de destination requise` signifie
+que le VPS ne connaît pas encore l'endpoint du pair : c'est au pair d'appeler le
+VPS en premier.
 
 ## 9. Points ouverts à vérifier
 
@@ -391,5 +528,14 @@ décisions D1 et D2 ainsi que les questions à poser sur place ci-dessus.
 - L'effet de l'accélération du routage sur l'exactitude des flux.
 - Si les flux exportés montrent des adresses avant ou après NAT.
 - L'état actuel de la version du provider libvirt choisie pour Terraform ou
-  OpenTofu.
+  OpenTofu (D10, reporté).
 - La joignabilité de l'interface de gestion de la parabole depuis le LAN.
+- La configuration WireGuard côté MikroTik réel : le tunnel a été validé avec un
+  laptop à la place du routeur, mais pas encore avec le routeur principal
+  lui-même (règle `input`, adresse `10.100.0.2`).
+- Où tourne le collecteur (sur le VPS ou sur un autre pair du tunnel), car cela
+  décide sur quelle adresse les services doivent écouter.
+- La politique de rotation des clés WireGuard et le rôle Ansible associé.
+- La version de RouterOS du RB1100AHx4 : si c'est RouterOS 6, WireGuard n'est
+  pas disponible et il faut choisir entre une mise à jour du routeur et un
+  hôte Linux local portant le tunnel (voir 4.12).
