@@ -11,8 +11,11 @@ d'échantillons réels.
 
 - Chaîne de collecte (flux, SNMP v3, syslog, sondes) : configurée et en service
   depuis le 2026-10-21.
-- Mesure de charge du routeur, recoupement avec les compteurs du routeur et
-  ingesteur : pas encore faits.
+- Rotation des fichiers bruts (`logrotate` et `cron`) : en place, archives
+  régulières observées le 2026-10-22.
+- Base SQLite : créée et vérifiée le 2026-10-23.
+- Ingesteur : lecteur de flux en cours d'écriture. Mesure de charge du routeur
+  et recoupement avec les compteurs du routeur : pas encore faits.
 
 Remplis le journal des résultats (section 11) au fur et à mesure. Les éléments
 marqués **(à vérifier)** dépendent de la version de RouterOS ou de l'outil et
@@ -52,6 +55,10 @@ flowchart LR
     G["goflow2<br/>UDP 2055"] --> F["flows.json"]
     S["rsyslog<br/>UDP 514"] --> L["router.log"]
     T["Telegraf<br/>SNMPv3 + ping"] --> M["metrics.jsonl"]
+    F --> I["Ingesteur"]
+    L --> I
+    M --> I
+    I --> D[("nad.db<br/>SQLite")]
   end
   R -- "flux (IPFIX)" --> G
   R -- "syslog" --> S
@@ -83,6 +90,9 @@ Ce qui en découle :
   **pas** ouverts côté public.
 - Le routeur n'est que le **messager** : chaque paquet de flux vient du routeur,
   mais son contenu décrit les conversations de tous les utilisateurs.
+- Les fichiers bruts grossissent vite (10 à 16 Mo par minute pour les flux) :
+  une rotation automatique, lancée par `cron`, est indispensable (étapes 2.3 et
+  2.6).
 
 ## 3. Prérequis
 
@@ -91,9 +101,10 @@ Ce qui en découle :
 - Un tunnel WireGuard fonctionnel entre le routeur et l'hôte NAD (sa mise en
   place est hors de ce guide). Vérifie-le depuis l'hôte avec `sudo wg show` et
   `ping -c 3 10.100.0.2`.
-- Un hôte Linux avec systemd. Sur l'hôte : `tcpdump`, `jq`, les outils clients
-  Net-SNMP (`snmpget`, `snmpwalk` : paquet `snmp` sur Debian/Ubuntu), `rsyslog`,
-  `goflow2` et `telegraf`.
+- Un hôte Linux avec systemd. Sur l'hôte : `tcpdump`, `jq`, `cron`, `sqlite3`,
+  les outils clients Net-SNMP (`snmpget`, `snmpwalk` : paquet `snmp` sur
+  Debian/Ubuntu), `rsyslog`, `goflow2` et `telegraf`, plus Python 3.9 ou plus
+  récent pour l'ingesteur.
 - Les horloges synchronisées par NTP sur l'hôte et sur le routeur (étape 1.4).
 - Le pare-feu du fournisseur : seuls SSH et le port UDP de WireGuard sont
   ouverts sur Internet, plus les autres services publics que l'hôte fournit.
@@ -200,13 +211,18 @@ scans, les inondations et les destinations inhabituelles.
 
 **Observé (RouterOS 7.23.8) :** exporter depuis le seul bridge LAN enregistre
 **les deux sens**, chaque flux une seule fois. Les flux montants portent
-l'adresse du poste interne (`192.168.26.x`). Les flux descendants portent une
-adresse traduite (`192.168.1.x`) au lieu de celle du client, car le routeur est
-derrière le routeur Starlink (double NAT) **(à vérifier)**. Beaucoup
-d'enregistrements sont de simples acquittements TCP de 40 octets : l'ingesteur
-doit donc agréger par fenêtre de temps, jamais travailler flux par flux. Le
-trafic destiné au routeur lui-même (par exemple le DNS vers `192.168.26.1`)
-apparaît aussi.
+l'adresse du poste interne (`192.168.26.x`). Les flux descendants portent
+l'adresse WAN du routeur (`192.168.1.101`, celle de `ether1`) au lieu de celle
+du client, car le routeur est derrière le routeur Starlink (double NAT) : le
+client réel n'y apparaît pas. Beaucoup d'enregistrements sont de simples
+acquittements TCP de 40 octets : l'ingesteur doit donc agréger par fenêtre de
+temps, jamais travailler flux par flux.
+
+Les index d'interface des flux désignent le LAN (16, `bridge1`), la liaison
+montante (1, `ether1`) et **0, qui veut dire « le routeur lui-même »**. Une
+part importante des flux est du trafic entre les postes et le routeur (DNS,
+connexion Hotspot, DHCP) : elle ne traverse pas la liaison Starlink et ne doit
+pas être comptée comme du trafic Internet (voir l'étape 3 et la section 10).
 
 Si des ports du bridge utilisent le hardware offload, le trafic entre deux ports
 LAN est commuté par la puce sans atteindre le CPU : il n'apparaît pas dans les
@@ -303,7 +319,8 @@ Notes :
   ont `log=yes`.
 - Le topic `info` est bavard : les événements DHCP et Hotspot dominent. Ces
   lignes contiennent des adresses MAC et des identifiants de connexion, qui sont
-  des données personnelles : voir les permissions et la rétention à l'étape 2.4.
+  des données personnelles : voir les permissions et la rétention aux étapes 2.4
+  et 2.6.
 
 ### 1.4 Heure
 
@@ -357,7 +374,7 @@ lui faut les identifiants avant que l'utilisateur existe sur le routeur.
 ### 2.1 Paquets, utilisateur de service et dossiers
 
 ```bash
-sudo apt-get update && sudo apt-get install -y rsyslog jq tcpdump snmp sqlite3 curl gpg
+sudo apt-get update && sudo apt-get install -y rsyslog cron jq tcpdump snmp sqlite3 curl gpg
 
 # Un utilisateur système sans connexion pour les fichiers des collecteurs
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin nad
@@ -377,7 +394,7 @@ paquet a créé son utilisateur.
 - **Pare-feu du fournisseur (filtre principal) :** n'ouvre que SSH, le port UDP
   de WireGuard (`sudo wg show wg0 listen-port`) et ce que l'hôte sert
   publiquement. Garde UDP 514 et UDP 2055 **fermés** : la télémétrie arrive à
-  l'intérieur du tunnel.
+  l'intérieur du tunnel, enveloppée dans le port de WireGuard.
 - **Écoute sur l'adresse du tunnel :** chaque récepteur n'écoute que sur
   `10.100.0.1` (voir les configurations plus bas) : même une règle de pare-feu
   erronée ne l'exposerait pas. Vérifie avec :
@@ -447,9 +464,16 @@ systemctl status goflow2 --no-pager
 L'état doit être `active (running)`. S'il redémarre en boucle, lis la cause avec
 `sudo journalctl -u goflow2 -n 20 --no-pager`.
 
-**Rotation (obligatoire) :** le fichier brut grossit de 10 à 16 Mo par minute
-(section 8). `logrotate` l'archive et le compresse quand il dépasse 200 Mo, et
-`cron` le vérifie toutes les 5 minutes :
+#### Rotation des flux bruts (obligatoire)
+
+En clair : le fichier brut est un cahier qui se remplit de 10 à 16 Mo par
+minute. La **rotation** consiste à ranger le cahier plein dans une boîte
+compressée, à repartir sur un cahier vide, et à jeter les plus vieilles boîtes,
+pour que le disque ne se remplisse jamais. L'outil standard de Linux pour cela
+est `logrotate`, et **`cron`** (le planificateur de tâches, un réveil qui lance
+une commande à intervalles réguliers) le réveille toutes les 5 minutes. Sans
+`cron`, `logrotate` ne passerait qu'une fois par jour, et le fichier
+atteindrait plusieurs dizaines de Go entre deux passages.
 
 ```bash
 sudo tee /etc/logrotate.d/nad-flows <<'EOF'
@@ -466,15 +490,66 @@ echo '*/5 * * * * root /usr/sbin/logrotate /etc/logrotate.d/nad-flows' | sudo te
 systemctl is-active cron
 ```
 
-`copytruncate` copie le fichier puis le vide sur place : goflow2 continue
-d'écrire sans redémarrage ; quelques lignes écrites pendant la copie peuvent
-être perdues, ce qui est acceptable ici. Avec `rotate 300`, l'historique est de
-deux à trois jours pour quelques Go au plus. Vérifie avec
-`sudo logrotate -d /etc/logrotate.d/nad-flows` puis, au bout d'environ 20
-minutes, `sudo ls -lh /var/lib/nad/flows/` (un `flows.json.1.gz` d'environ 5 à
-6 Mo doit apparaître).
+La recette de rotation, ligne par ligne :
 
-Le dossier est en `750` : lis ces fichiers avec `sudo`.
+| Ligne | Signification |
+|---|---|
+| `/var/lib/nad/flows/flows.json {` | Le fichier concerné |
+| `size 200M` | N'archiver que lorsqu'il dépasse 200 Mo, quelle que soit l'heure |
+| `rotate 300` | Garder 300 archives, supprimer les plus anciennes |
+| `compress` | Compresser les archives (gzip) |
+| `copytruncate` | Copier le contenu puis vider le fichier sur place |
+| `missingok` | Pas d'erreur si le fichier n'existe pas |
+| `notifempty` | Ne rien faire s'il est vide |
+
+La ligne `cron` se lit : minute `*/5` (toutes les 5 minutes), puis quatre `*`
+(toutes les heures, tous les jours, tous les mois, tous les jours de la
+semaine), l'utilisateur `root`, et la commande à lancer. `sudo tee` crée le
+fichier avec les bons droits (propriétaire `root`, non modifiable par les
+autres). Dans `/etc/cron.d`, le nom du fichier ne doit contenir que des lettres,
+chiffres, tirets et soulignés (pas de point), sinon `cron` l'ignore.
+
+Points à connaître :
+
+- **`copytruncate`** copie le fichier puis le vide sur place : goflow2 continue
+  d'écrire sans redémarrage. Quelques lignes écrites pendant la copie peuvent
+  être perdues, ce qui est acceptable ici.
+- **Dépassement :** la vérification a lieu toutes les 5 minutes, donc un fichier
+  peut dépasser 200 Mo de quelques dizaines de Mo avant d'être archivé.
+- **Numérotation :** à chaque rotation, `flows.json.1.gz` devient `.2.gz`, et
+  ainsi de suite. Plus le numéro est grand, plus l'archive est ancienne.
+- **Ordre de grandeur :** une archive tous les 15 à 45 minutes selon l'activité,
+  de 4 à 6 Mo chacune. Avec `rotate 300`, l'historique est de deux à trois jours
+  pour moins de 2 Go.
+- **Fichiers hors motif :** `logrotate` ne gère que `flows.json` et ses
+  archives numérotées. Une archive faite à la main sous un autre nom n'est
+  jamais supprimée : retire-la quand elle ne sert plus.
+- **Minuteur du système :** Debian lance aussi `logrotate` une fois par jour sur
+  tous les fichiers de `/etc/logrotate.d` **(à vérifier)**. C'est sans
+  conséquence ici, puisque le critère est la taille.
+
+Vérifier :
+
+```bash
+# Simulation : n'écrit rien, affiche la décision (beaucoup de lignes « Creating new state » : normal en mode debug)
+sudo logrotate -d /etc/logrotate.d/nad-flows
+
+# cron a-t-il bien lancé la commande ? (environ 6 lignes par demi-heure)
+sudo journalctl -u cron --since "30 min ago" --no-pager | grep -c nad-flows
+
+# Au bout d'environ 20 minutes, une archive doit apparaître
+sudo ls -lh /var/lib/nad/flows/
+```
+
+Tu dois voir `flows.json` (qui repart petit) et `flows.json.1.gz` (4 à 6 Mo).
+Si le fichier actif dépasse largement 200 Mo, regarde la section 12.
+
+Le dossier est en `750` : lis ces fichiers avec `sudo`. Pour examiner une
+archive sans la décompresser sur le disque :
+
+```bash
+sudo zcat /var/lib/nad/flows/flows.json.1.gz | head -n 1 | jq .
+```
 
 ### 2.4 Récepteur syslog (rsyslog)
 
@@ -505,14 +580,25 @@ sudo systemctl daemon-reload
 sudo systemctl restart rsyslog
 ```
 
+Si `router.log` existait déjà avec d'autres droits, corrige-les une fois :
+
+```bash
+sudo chmod 640 /var/log/mikrotik/router.log
+sudo chown root:adm /var/log/mikrotik/router.log
+```
+
 Test : sur le routeur, lance `/log info "test nad"`, puis sur l'hôte :
 
 ```bash
 sudo tail -f /var/log/mikrotik/router.log
 ```
 
-**Rotation et rétention :** le fichier contient des adresses MAC et des
-identifiants de connexion : garde-le peu de temps (14 jours ici) :
+#### Rotation et rétention des journaux
+
+Le fichier contient des adresses MAC et des identifiants de connexion : garde-le
+peu de temps (14 jours ici). Contrairement aux flux, une rotation par jour
+suffit : c'est le minuteur quotidien du système qui lance `logrotate` pour ce
+fichier, sans `cron` supplémentaire.
 
 ```bash
 ls /usr/lib/rsyslog/rsyslog-rotate
@@ -529,12 +615,18 @@ sudo tee /etc/logrotate.d/mikrotik <<'EOF'
 }
 EOF
 sudo logrotate -d /etc/logrotate.d/mikrotik
+systemctl list-timers logrotate.timer --no-pager
 ```
 
-Si le script d'aide n'existe pas, remplace le bloc `postrotate` par
-`copytruncate`. Si le fichier reste vide, vérifie que l'adresse du routeur dans
-le filtre correspond, que rsyslog écoute bien sur `10.100.0.1` (`ss -lunp`), et
-que `wg0` était monté au démarrage de rsyslog.
+Le bloc `postrotate` demande à rsyslog de rouvrir son fichier après la rotation
+(ici, pas de `copytruncate`). Si le script d'aide n'existe pas, remplace ce bloc
+par `copytruncate`. La dernière commande confirme que le minuteur quotidien est
+bien planifié.
+
+Si le fichier reste vide, vérifie que l'adresse du routeur dans le filtre
+correspond, que rsyslog écoute bien sur `10.100.0.1` (`ss -lunp`), et que `wg0`
+était monté au démarrage de rsyslog. Après la première rotation quotidienne,
+vérifie que le nouveau fichier garde les droits `640`.
 
 ### 2.5 SNMP et sondes (Telegraf)
 
@@ -604,7 +696,10 @@ EOF
 ```
 
 SNMP : durée de fonctionnement, CPU par cœur et compteurs d'interface. Les OID
-numériques fonctionnent sans fichiers MIB :
+numériques fonctionnent sans fichiers MIB. `index_as_tag = true` écrit le
+numéro d'interface (étiquette `index`) à côté du nom (`ifName`) : c'est ce
+numéro que portent les flux (`in_if`, `out_if`), et c'est lui qui permet de
+relier les deux sources :
 
 ```bash
 sudo tee /etc/telegraf/telegraf.d/10-snmp.conf <<'EOF'
@@ -634,6 +729,7 @@ sudo tee /etc/telegraf/telegraf.d/10-snmp.conf <<'EOF'
 
   [[inputs.snmp.table]]
     name = "router_if"
+    index_as_tag = true
     [[inputs.snmp.table.field]]
       name = "ifName"
       oid = "1.3.6.1.2.1.31.1.1.1.1"
@@ -670,7 +766,8 @@ sudo tee /etc/telegraf/telegraf.d/20-probes.conf <<'EOF'
 EOF
 ```
 
-Sortie : une ligne JSON par mesure, avec rotation intégrée :
+Sortie : une ligne JSON par mesure, avec rotation intégrée (une archive par
+jour, 7 gardées) :
 
 ```bash
 sudo tee /etc/telegraf/telegraf.d/90-output.conf <<'EOF'
@@ -691,7 +788,8 @@ sudo bash -c 'set -a; . /etc/default/telegraf; telegraf --test --config /etc/tel
 ```
 
 Attends-toi à des lignes commençant par `ping`, `router`, `router_cpu` et
-`router_if`. Un avertissement à propos de `agent_host_tag` est sans conséquence.
+`router_if`, avec `ifName=bridge1,index=16` pour le LAN. Un avertissement à
+propos de `agent_host_tag` est sans conséquence.
 
 **Démarrer et vérifier :**
 
@@ -709,22 +807,58 @@ Surveille aussi la mémoire pendant quelques minutes
 (`ps -o rss=,etime= -C telegraf`) : environ 280 Mo est normal sur cet hôte, et
 l'important est qu'elle reste stable.
 
-### 2.6 Vérification de bout en bout
+### 2.6 Rotation et rétention : vue d'ensemble
+
+Chaque fichier qui grossit a sa règle. Aucun ne doit grandir sans limite.
+
+| Fichier | Qui le fait tourner | Quand | Conservation | Pourquoi |
+|---|---|---|---|---|
+| `/var/lib/nad/flows/flows.json` | `logrotate`, réveillé par `cron` (`/etc/cron.d/nad-flows`) | Vérification toutes les 5 minutes, rotation au-dessus de 200 Mo | 300 archives compressées (2 à 3 jours, moins de 2 Go) | 10 à 16 Mo bruts par minute |
+| `/var/log/mikrotik/router.log` | `logrotate`, minuteur quotidien du système | Une fois par jour | 14 jours | Contient des adresses MAC et des identifiants (données personnelles) |
+| `/var/lib/nad/telemetry/metrics.jsonl` | Telegraf (rotation intégrée) | Toutes les 24 heures | 7 archives | Petit volume |
+| `/var/lib/nad/nad.db` | Aucune | | Croît lentement (1 440 lignes par jour) | Les fenêtres sont minuscules |
+
+Comment contrôler que tout tourne :
+
+```bash
+# Le planificateur est actif et lance bien la rotation des flux
+systemctl is-active cron
+cat /etc/cron.d/nad-flows
+sudo journalctl -u cron --since "30 min ago" --no-pager | grep -c nad-flows
+
+# Le minuteur quotidien du système est planifié
+systemctl list-timers logrotate.timer --no-pager
+
+# Les archives s'accumulent à un rythme régulier, et le disque reste raisonnable
+sudo ls -lh /var/lib/nad/flows/ | tail -n 5
+du -sh /var/lib/nad
+df -h /
+```
+
+Les flux bruts sont la seule source qui pèse vraiment : les archives sont une
+**réserve temporaire**, lue par l'ingesteur (qui lit aussi les archives, voir
+l'étape 5), et les lignes qu'il stocke dans `nad.db` sont, elles, définitives.
+Si l'ingesteur reste arrêté plus de deux à trois jours, les archives les plus
+anciennes disparaissent avant d'avoir été lues.
+
+### 2.7 Vérification de bout en bout
 
 ```bash
 systemctl is-active goflow2 telegraf rsyslog cron
 systemctl is-enabled goflow2 telegraf rsyslog cron wg-quick@wg0
 sudo ss -lunp | grep -E ':(514|2055)\b'
-sudo wc -l /var/lib/nad/flows/flows.json
+sudo ls -lh /var/lib/nad/flows/ | tail -n 5
 sudo tail -n 200 /var/lib/nad/telemetry/metrics.jsonl | jq -r '.name' | sort | uniq -c
 sudo tail -n 2 /var/log/mikrotik/router.log
+df -h /
 ```
 
 Attends-toi à : tous les services actifs et activés au démarrage, goflow2 et
-rsyslog attachés à `10.100.0.1`, un fichier de flux qui grossit, les quatre noms
-de mesure (`ping`, `router`, `router_cpu`, `router_if`) et des lignes de journal
-récentes. Si un service a été arrêté, ses données ont un trou : note la
-période, car l'ingesteur doit la traiter comme une donnée manquante (étape 5).
+rsyslog attachés à `10.100.0.1`, des archives de flux régulières, les quatre
+noms de mesure (`ping`, `router`, `router_cpu`, `router_if`), des lignes de
+journal récentes, et un disque peu utilisé. Si un service a été arrêté, ses
+données ont un trou : note la période, car l'ingesteur doit la traiter comme une
+donnée manquante (étape 5).
 
 ---
 
@@ -746,28 +880,46 @@ F=/var/lib/nad/flows/flows.json
 # Afficher joliment le premier enregistrement de flux
 sudo head -n 1 $F | jq .
 
-# Répartition par sens (adapte le préfixe LAN)
-sudo jq -r 'if (.src_addr|startswith("192.168.26.")) then "montant"
-            elif (.dst_addr|startswith("192.168.26.")) then "vers-lan"
-            else "autre" end' $F | sort | uniq -c
+# Répartition par paire d'index (in_if, out_if) ; 0 = le routeur lui-même
+sudo jq -r '[.in_if,.out_if] | @tsv' $F | sort | uniq -c | sort -rn | head
+
+# Composition du trafic des postes vers le routeur (protocole et port de destination)
+sudo jq -r 'select(.in_if==16 and .out_if==0) | "\(.proto) \(.dst_port)"' $F | sort | uniq -c | sort -rn | head
 
 # Nombre de postes internes distincts vus
-sudo jq -r 'select(.src_addr|startswith("192.168.26.")) | .src_addr' $F | sort -u | wc -l
-
-# Index d'interface qui apparaissent de chaque côté
-sudo jq -r '[.in_if,.out_if] | @tsv' $F | sort | uniq -c | sort -rn | head
+sudo jq -r 'select(.in_if==16) | .src_addr' $F | sort -u | wc -l
 
 # Échantillon de développement tiré d'une archive (ne touche pas au fichier actif)
 mkdir -p ~/nad-samples
 sudo zcat /var/lib/nad/flows/flows.json.1.gz | head -n 50000 > ~/nad-samples/flows-sample.jsonl
-sudo chown $USER ~/nad-samples/flows-sample.jsonl && chmod 600 ~/nad-samples/flows-sample.jsonl
+chmod 600 ~/nad-samples/flows-sample.jsonl
 ```
+
+**Observé sur un fichier actif de 142 956 flux (les proportions varient avec
+l'activité) :**
+
+| Paire (`in_if` vers `out_if`) | Nombre | Signification |
+|---|---|---|
+| 16 vers 1 | 25 191 | Montant : poste du LAN vers Internet |
+| 1 vers 16 | 24 398 | Descendant : Internet vers poste du LAN |
+| 16 vers 0 | 44 176 | Poste du LAN vers le routeur lui-même |
+| 0 vers 16 | 49 188 | Le routeur répond à un poste du LAN |
+| 16 vers 16 | 2 | Entre deux postes du LAN |
+| 16 vers un autre bridge | 1 | Vers un réseau séparé hors périmètre |
+
+Le trafic vers le routeur est donc très important (ici deux tiers des flux). Sur
+un échantillon de 100 000 lignes, sa composition était : TCP 443 (2 900),
+UDP 53 (1 574), TCP 80 (157), TCP 8080 (34), TCP 64875 et 64874 (27, ports du
+Hotspot **(à vérifier)**), UDP 67 (16, DHCP), UDP 5678 (8, découverte des
+équipements MikroTik), ICMP et TCP 53 (7). Ce sont les services du routeur
+(DNS, Hotspot, DHCP) : ce trafic reflète surtout l'arrivée des utilisateurs, et
+une explosion soudaine serait un signal utile pour la détection.
 
 **Volume :** chaque ligne JSON brute fait environ 1 Ko, en majorité des champs
 inutiles (BGP, MPLS, IPv6). Sur ce réseau, cela représente **10 à 16 Mo par
-minute**, de l'ordre de 15 à 23 Go de JSON brut par jour. Gzip le réduit d'un
-facteur 30 à 40 (environ 200 Mo deviennent 6 Mo), d'où la rotation de l'étape
-2.3 et la sélection des champs dans l'ingesteur.
+minute selon l'activité**, de l'ordre de 15 à 23 Go de JSON brut par jour.
+Gzip le réduit d'un facteur 30 à 40 (environ 200 Mo deviennent 4 à 6 Mo), d'où
+la rotation de l'étape 2.3 et la sélection des champs dans l'ingesteur.
 
 Une session de test valide la **chaîne de traitement**, pas la référence. La
 référence sera construite plus tard à partir de la collecte continue.
@@ -806,7 +958,7 @@ sudo jq -r --argjson s $S --argjson e $E \
 
 Le cœur le plus chargé compte : un cœur peut saturer alors que la moyenne paraît
 basse. La mémoire du routeur n'est pas encore collectée (l'ajout de la table de
-stockage est prévu, étape 13).
+stockage est prévu, section 13).
 
 ### 4.2 Recouper les flux avec SNMP
 
@@ -819,17 +971,19 @@ Utilise uniquement le bridge LAN : ses deux compteurs couvrent les deux sens, et
 contrairement à la liaison montante, ils excluent l'encapsulation du tunnel et le
 trafic refusé par le pare-feu.
 
-| Compteur SNMP du bridge LAN | Correspond aux flux avec | Sens |
+| Compteur SNMP du bridge LAN | Correspond aux flux avec | Ce que ça couvre |
 |---|---|---|
-| `in_octets` (ce que les machines du LAN envoient) | `in_if` = index de l'interface LAN | Montant |
-| `out_octets` (ce que le routeur leur livre) | `out_if` = index de l'interface LAN | Descendant |
+| `in_octets` | `in_if` = index du LAN, **toutes classes** | Tout ce que le LAN envoie : vers Internet **et** vers le routeur |
+| `out_octets` | `out_if` = index du LAN, **toutes classes** | Tout ce que le routeur livre au LAN : depuis Internet **et** ses propres réponses |
 
-Trouve d'abord l'index d'interface du bridge LAN (l'index est le dernier nombre
-de l'OID ; les phrases de passe viennent du fichier d'environnement, et
-apparaissent dans `ps` le temps de la commande) :
+Le recoupement compare donc les compteurs à **tous** les flux qui entrent ou
+sortent par le LAN. Ce n'est pas la même chose que les colonnes « montant » et
+« descendant » de la base (section 10), qui excluent le trafic vers le routeur.
+
+Trouve d'abord l'index du bridge LAN, que Telegraf écrit maintenant lui-même :
 
 ```bash
-sudo bash -c 'set -a; . /etc/default/telegraf; snmpwalk -v3 -l authPriv -u "$SNMP_USER" -a SHA -A "$SNMP_AUTH_PASS" -x AES -X "$SNMP_PRIV_PASS" 10.100.0.2 1.3.6.1.2.1.31.1.1.1.1'
+sudo jq -r 'select(.name=="router_if" and .tags.ifName=="bridge1") | .tags.index' /var/lib/nad/telemetry/metrics.jsonl | tail -n 1
 ```
 
 Compare ensuite deux relevés consécutifs de `bridge1` par Telegraf avec les flux
@@ -846,15 +1000,14 @@ sudo jq -r 'select(.name=="router_if" and .tags.ifName=="bridge1") | [.timestamp
 T1=<premier-horodatage>; T2=<second-horodatage>
 sudo jq -r --argjson b $B --argjson s $T1 --argjson e $T2 \
   'select((.time_flow_end_ns/1e9)>=$s and (.time_flow_end_ns/1e9)<$e)
-   | [(if .in_if==$b then "montant" elif .out_if==$b then "descendant" else "autre" end), .bytes] | @tsv' \
+   | [(if .in_if==$b then "lan_envoie" elif .out_if==$b then "lan_recoit" else "autre" end), .bytes] | @tsv' \
   /var/lib/nad/flows/flows.json | awk '{a[$1]+=$2} END {for (k in a) print k, a[k]}'
 ```
 
 Compare chaque différence de compteur avec le total correspondant. Attends-toi à
 un accord approximatif, pas à une égalité : les compteurs du bridge incluent
-aussi le trafic vers et depuis le routeur lui-même (DNS, administration,
-interrogation SNMP) et l'encapsulation Ethernet, que les flux ne comptent pas.
-Un grand écart renvoie à l'une des causes de la section 12.
+aussi l'encapsulation Ethernet, que les flux ne comptent pas, et l'interrogation
+SNMP elle-même. Un grand écart renvoie à l'une des causes de la section 12.
 
 ## 10. Étape 5 — Concevoir l'ingesteur
 
@@ -878,29 +1031,31 @@ source sans toucher au reste :
 
 | Décision | Pourquoi |
 |---|---|
-| Tous les horodatages en UTC, fenêtres alignées sur la minute ; la baseline hebdomadaire est calculée dans le fuseau du site (`Indian/Antananarivo`, UTC+3, pas de changement d'heure) | Les utilisateurs suivent leur propre horloge ; le fuseau de l'hôte et son changement d'heure ne doivent jamais compter |
+| Tous les horodatages en UTC, fenêtres d'une minute alignées sur la minute ; la baseline hebdomadaire est calculée dans le fuseau du site (`Indian/Antananarivo`, UTC+3, pas de changement d'heure) | Les utilisateurs suivent leur propre horloge ; le fuseau de l'hôte et son changement d'heure ne doivent jamais compter |
+| Stocker en fenêtres d'une minute, détecter sur des fenêtres de cinq minutes construites à partir de cinq lignes | On peut toujours regrouper des lignes d'une minute, jamais l'inverse ; cinq minutes lissent les pics sur un petit réseau |
 | Fermer une fenêtre seulement après un délai | Les flux arrivent en retard (délais du routeur) ; fermer immédiatement sous-compterait |
-| Écritures idempotentes (upsert sur la clé de fenêtre) | Relancer l'ingesteur ne doit jamais dupliquer de lignes |
-| Mémoriser la position de lecture par fichier, et lire aussi les archives | Les fichiers tournent toutes les 15 à 20 minutes ; un arrêt ne doit ni sauter ni répéter des données |
-| Une fenêtre sans donnée collectée est stockée comme manquante, jamais comme zéro | Un service arrêté crée un trou qui ne doit pas passer pour un réseau silencieux |
+| Écritures idempotentes (upsert sur la clé de fenêtre), chaque source ne touchant que ses propres colonnes | Relancer l'ingesteur ne doit jamais dupliquer de lignes ; les trois sources arrivent à des moments différents et ne doivent pas s'écraser |
+| Mémoriser la position de lecture par fichier, et lire aussi les archives | Les fichiers tournent toutes les 15 à 45 minutes ; un arrêt ne doit ni sauter ni répéter des données |
+| Une source sans données laisse ses colonnes à NULL et son drapeau `has_*` à 0, jamais zéro | Un service arrêté crée un trou qui ne doit pas passer pour un réseau silencieux ; NULL veut dire « inconnu » |
 | Les compteurs SNMP sont cumulatifs : utiliser la différence entre deux relevés consécutifs, et écarter les différences négatives | Les compteurs repartent de zéro quand le routeur redémarre |
-| Sens déterminé par `in_if`/`out_if`, pas par les adresses | Les flux portent des index d'interface ; le côté liaison montante est stable |
-| Garder une table de correspondance entre index et nom d'interface | Les flux portent des index, Telegraf des noms (prévu : `index_as_tag`, étape 13) |
-| Caractéristiques par hôte calculées sur les flux montants uniquement | Les flux descendants portent une adresse traduite, pas celle du client |
+| Classe d'un flux d'après la **paire** (`in_if`, `out_if`) : LAN vers WAN est montant, WAN vers LAN est descendant, LAN vers 0 et 0 vers LAN sont du trafic avec le routeur lui-même, toute autre paire est `other` | L'index 0 est le routeur lui-même (DNS, Hotspot, DHCP) ; le compter comme du montant gonflerait de plus de la moitié le trafic Internet |
+| Index d'interface résolus à partir des noms au démarrage (Telegraf écrit `ifName` et `index`) | Les index peuvent changer quand des interfaces apparaissent ou disparaissent |
+| Caractéristiques par hôte calculées sur les flux LAN vers WAN ; `distinct_hosts` sur tous les flux qui entrent depuis le LAN | Les flux descendants portent l'adresse WAN du routeur, pas celle du client ; un poste qui ne fait que du DNS est quand même actif |
 | Classes d'adresses en configuration : interne (LAN), amont (LAN du routeur Starlink), tunnel d'administration | Le trafic amont et d'administration n'est ni celui des utilisateurs internes ni Internet |
-| Ne garder que les champs utiles dès la lecture | Les enregistrements bruts font ~1 Ko, surtout des champs inutiles |
+| Ne garder que les champs utiles dès la lecture, et compter les lignes inutilisables sans planter | Les enregistrements bruts font ~1 Ko, surtout des champs inutiles ; la dernière ligne d'un fichier actif peut être coupée |
 | Affecter un flux à la fenêtre de son heure de fin | Simple et déterministe ; avec un délai actif d'une minute, un flux ne s'étend jamais sur plus de deux fenêtres |
+| Tables `STRICT`, avec des contraintes CHECK sur l'alignement, les drapeaux et les différences de compteurs | Un bug de l'ingesteur échoue bruyamment au lieu de stocker une mauvaise valeur |
 
-Champs utilisés dans goflow2 : `time_flow_start_ns`, `time_flow_end_ns`,
-`src_addr`, `dst_addr`, `src_port`, `dst_port`, `proto`, `bytes`, `packets`,
-`in_if`, `out_if`, `tcp_flags`, `sampler_address`. Les horodatages sont en
-nanosecondes.
+Champs utilisés dans goflow2 : `time_flow_end_ns`, `in_if`, `out_if`, `bytes`,
+`packets`, `src_addr`, `dst_addr`, `dst_port` (les autres, comme `src_port`,
+`proto` ou `tcp_flags`, restent disponibles pour des caractéristiques
+ultérieures). Les horodatages sont en nanosecondes.
 
-Mesures Telegraf utilisées : `router_if` (étiquette `ifName` ; champs
-`in_octets`, `out_octets`, `in_errors`, `out_errors`, `oper_status`),
+Mesures Telegraf utilisées : `router_if` (étiquettes `ifName` et `index` ;
+champs `in_octets`, `out_octets`, `in_errors`, `out_errors`, `oper_status`),
 `router_cpu` (étiquette `index` ; champ `cpu_load`), `router` (`uptime`) et
-`ping` (`average_response_ms`, `minimum_response_ms`, `maximum_response_ms`,
-`percent_packet_loss`, `result_code`). Les horodatages sont en secondes Unix.
+`ping` (`average_response_ms`, `maximum_response_ms`, `packets_transmitted`,
+`packets_received`, `result_code`). Les horodatages sont en secondes Unix.
 
 Exemple de configuration (valeurs du réseau de référence) :
 
@@ -911,48 +1066,183 @@ upstream_subnets:
   - 192.168.1.0/24    # LAN du routeur Starlink (ni interne, ni Internet)
 management_subnets:
   - 10.100.0.0/24     # Tunnel WireGuard entre le routeur et l'hôte NAD
-lan_interface: bridge1   # index à résoudre (16 observé côté LAN dans les flux)
-wan_interface: ether1    # index 1 observé côté liaison montante, à confirmer
+lan_interface: bridge1   # index 16 (à résoudre au démarrage)
+wan_interface: ether1    # index 1 (à résoudre au démarrage)
+router_index: 0          # « le routeur lui-même » dans les flux
+ignored_interfaces:
+  - bridge2              # réseau séparé à usage spécifique, hors périmètre
 timezone: Indian/Antananarivo
 ```
 
-### Schéma provisoire (à ajuster après avoir vu de vrais enregistrements)
+### Stockage : la base de données SQLite
 
-```sql
--- Une ligne par fenêtre d'une minute, issue des flux, des compteurs et des journaux
+En termes simples : la base est un seul fichier qui fonctionne comme un
+tableur. Chaque ligne est une minute de vie du réseau, chaque colonne est un
+résumé de cette minute. Les lecteurs de flux, de SNMP et de journaux écrivent
+dans la même ligne à des moments différents, chacun ne remplissant que ses
+propres colonnes.
+
+**Installer les outils.** Le client en ligne de commande `sqlite3` sert à créer
+et inspecter le fichier ; Python fournit déjà son propre module `sqlite3`.
+
+```bash
+sudo apt-get install -y sqlite3
+sqlite3 --version
+python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
+```
+
+Les deux versions doivent être 3.37 ou plus récentes (les tables `STRICT`
+l'exigent ; la syntaxe d'upsert utilisée par l'ingesteur demande la 3.24). Si
+l'une est plus ancienne, retire `STRICT` des instructions ci-dessous.
+
+**Créer la base** avec l'utilisateur de service, pour qu'il possède le fichier.
+Le réglage `PRAGMA journal_mode = WAL` est enregistré dans le fichier : les
+lecteurs et l'écrivain ne se bloquent plus mutuellement.
+
+```bash
+sudo -u nad sqlite3 /var/lib/nad/nad.db <<'EOF'
+PRAGMA journal_mode = WAL;
+PRAGMA user_version = 1;
+
+-- One row per one-minute window (UTC, aligned to the minute).
+-- Flows are classified by the pair (in_if, out_if): LAN = bridge1, WAN = ether1,
+-- index 0 = the router itself. Each flow lands in exactly one class.
+-- A source with no data for the window leaves its columns NULL and its has_* flag at 0.
 CREATE TABLE IF NOT EXISTS windows (
-  window_start      INTEGER PRIMARY KEY,  -- secondes unix, UTC, alignées sur la minute
-  flows             INTEGER,
-  bytes_up          INTEGER,
-  bytes_down        INTEGER,
-  packets_up        INTEGER,
-  packets_down      INTEGER,
-  distinct_hosts    INTEGER,              -- à partir des flux montants
-  distinct_dests    INTEGER,
-  distinct_ports    INTEGER,
-  top_talker_share  REAL,                 -- à partir des flux montants
-  cpu_pct           REAL,                 -- moyenne des cœurs
-  cpu_core_max_pct  REAL,                 -- cœur le plus chargé
-  log_events        INTEGER,
-  data_complete     INTEGER,              -- 0 si une source avait un trou dans cette fenêtre
-  ingested_at       INTEGER
-);
+  window_start       INTEGER PRIMARY KEY CHECK (window_start % 60 = 0),
 
--- Une ligne par fenêtre et par cible de sonde (plusieurs cibles par fenêtre plus tard)
+  -- from flows
+  flows_up           INTEGER,   -- LAN -> WAN (upload)
+  bytes_up           INTEGER,
+  packets_up         INTEGER,
+  flows_down         INTEGER,   -- WAN -> LAN (download)
+  bytes_down         INTEGER,
+  packets_down       INTEGER,
+  flows_to_router    INTEGER,   -- LAN -> router itself (DNS, Hotspot, DHCP)
+  bytes_to_router    INTEGER,
+  flows_from_router  INTEGER,   -- router itself -> LAN
+  bytes_from_router  INTEGER,
+  flows_other        INTEGER,   -- any other pair
+  distinct_hosts     INTEGER,   -- LAN hosts seen as flow source (all flows entering from the LAN)
+  distinct_dests     INTEGER,   -- from LAN -> WAN flows
+  distinct_ports     INTEGER,   -- destination ports of LAN -> WAN flows
+  top_talker_share   REAL,      -- busiest host's share of bytes_up, between 0 and 1
+
+  -- from SNMP
+  cpu_pct            REAL,      -- mean of the cores
+  cpu_core_max_pct   REAL,      -- busiest core
+  lan_in_bytes       INTEGER CHECK (lan_in_bytes IS NULL OR lan_in_bytes >= 0),   -- bridge1 counter difference
+  lan_out_bytes      INTEGER CHECK (lan_out_bytes IS NULL OR lan_out_bytes >= 0),
+
+  -- from router logs
+  log_events         INTEGER,
+
+  -- which sources had data for this window
+  has_flows          INTEGER NOT NULL DEFAULT 0 CHECK (has_flows IN (0, 1)),
+  has_snmp           INTEGER NOT NULL DEFAULT 0 CHECK (has_snmp IN (0, 1)),
+  has_logs           INTEGER NOT NULL DEFAULT 0 CHECK (has_logs IN (0, 1)),
+  ingested_at        INTEGER NOT NULL
+) STRICT;
+
+-- One row per window and probe target
 CREATE TABLE IF NOT EXISTS probe_windows (
-  window_start  INTEGER,
-  target        TEXT,                     -- ex. l'adresse du routeur dans le tunnel
-  rtt_mean_ms   REAL,
-  rtt_p95_ms    REAL,
-  loss_pct      REAL,
+  window_start    INTEGER NOT NULL CHECK (window_start % 60 = 0),
+  target          TEXT NOT NULL,
+  rtt_mean_ms     REAL,
+  rtt_max_ms      REAL,
+  pings_sent      INTEGER,
+  pings_received  INTEGER,
   PRIMARY KEY (window_start, target)
-);
+) STRICT;
+
+-- Where the ingestor stopped in each input file, to resume without duplicates
+CREATE TABLE IF NOT EXISTS file_offsets (
+  path         TEXT PRIMARY KEY,
+  inode        INTEGER,
+  byte_offset  INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+) STRICT;
+EOF
 ```
 
 Les sondes ont leur propre table, car chaque fenêtre a une ligne par cible.
 Sonder à la fois le tunnel et, plus tard, des cibles Internet depuis le site
 permet de distinguer un problème de liaison locale d'un problème de liaison
-satellite.
+satellite. Il n'y a pas de percentile de latence : Telegraf n'enregistre pas
+chaque ping, seulement le résumé de la minute (moyenne, maximum, nombre de
+réponses), donc un 95e percentile n'aurait pas de sens.
+
+**Vérifier :**
+
+```bash
+sudo -u nad sqlite3 /var/lib/nad/nad.db '.tables' 'PRAGMA journal_mode;' 'PRAGMA user_version;'
+sudo -u nad sqlite3 /var/lib/nad/nad.db '.schema probe_windows'
+sudo ls -l /var/lib/nad/
+```
+
+Attends-toi aux trois tables, à `wal`, à `1`, et à un fichier `nad.db` qui
+appartient à `nad`. Des fichiers `nad.db-wal` et `nad.db-shm` apparaissent à
+côté tant qu'un programme a la base ouverte : c'est normal.
+
+**Test rapide** (rien n'est conservé : il se termine par `ROLLBACK`). Il vérifie
+l'upsert et les contraintes :
+
+```bash
+sudo -u nad sqlite3 /var/lib/nad/nad.db <<'EOF'
+BEGIN;
+INSERT INTO windows (window_start, bytes_up, has_flows, ingested_at)
+  VALUES (1792700040, 1000, 1, 1792700100);
+INSERT INTO windows (window_start, bytes_up, has_flows, ingested_at)
+  VALUES (1792700040, 2000, 1, 1792700101)
+  ON CONFLICT(window_start) DO UPDATE SET bytes_up = excluded.bytes_up;
+SELECT window_start, bytes_up FROM windows;
+INSERT INTO windows (window_start, ingested_at) VALUES (1792700041, 1792700100);
+ROLLBACK;
+SELECT count(*) FROM windows;
+EOF
+```
+
+Attends-toi à `1792700040|2000` (une seule ligne, mise à jour et non
+dupliquée), puis à une erreur `CHECK constraint failed` pour la fenêtre non
+alignée sur la minute, puis à `0`.
+
+**Règles pour tout programme qui utilise la base :**
+
+- Lance l'ingesteur, le détecteur et le tableau de bord avec l'utilisateur
+  `nad`. En mode WAL, même un lecteur écrit dans le fichier `-shm` : un lecteur
+  sans droit d'écriture sur le dossier échoue.
+- À chaque connexion, règle `PRAGMA busy_timeout = 5000;` et
+  `PRAGMA synchronous = NORMAL;` (ces deux réglages sont propres à la
+  connexion, contrairement au mode de journal).
+- Ne copie jamais `nad.db` pendant que l'ingesteur tourne. Utilise
+  `sqlite3 /var/lib/nad/nad.db ".backup '/chemin/copie.db'"`.
+- Chaque source met à jour uniquement ses propres colonnes et son propre
+  drapeau `has_*`, par un upsert sur `window_start` : les trois sources
+  peuvent remplir la même ligne sans s'écraser.
+- Quand une source a des données pour une fenêtre (`has_*` = 1), toutes les
+  colonnes de cette source contiennent un nombre, 0 quand rien ne s'est
+  passé, jamais NULL. NULL veut dire « inconnu ».
+- `has_flows` est mis à 1 quand au moins un enregistrement de flux s'est
+  terminé dans la fenêtre, et `has_snmp` quand un relevé de Telegraf la
+  couvre. `has_logs` est mis à 1 quand au moins une ligne de journal est
+  arrivée ; une fenêtre sans aucune ligne est rare sur ce réseau (DHCP et
+  Hotspot sont bavards) et compte comme manquante.
+
+**Des lignes d'une minute aux fenêtres de cinq minutes.** Le détecteur
+(Python, `pandas`) construit les fenêtres de cinq minutes à partir de cinq
+lignes stockées :
+
+| Colonnes | Combinaison sur cinq minutes |
+|---|---|
+| Nombres de flux, octets, paquets, `log_events`, `lan_in_bytes`, `lan_out_bytes`, `pings_sent`, `pings_received` | Somme |
+| `cpu_pct`, `rtt_mean_ms` | Moyenne |
+| `cpu_core_max_pct`, `rtt_max_ms`, `top_talker_share` | Maximum |
+| `distinct_hosts`, `distinct_dests`, `distinct_ports` | Maximum des cinq lignes (une somme compterait deux fois un poste actif pendant deux minutes) ; à recalculer depuis les flux bruts si l'exactitude compte |
+
+La perte de paquets sur cinq minutes est
+`1 - sum(pings_received) / sum(pings_sent)`, exacte car les deux nombres sont
+stockés. Une fenêtre de cinq minutes n'est utilisée que si assez de ses cinq
+lignes ont des données (règle à définir dans le détecteur).
 
 ## 11. Journal des résultats
 
@@ -967,12 +1257,19 @@ Remplis-le après chaque session. Ces valeurs alimentent les décisions de
 | Tunnel | WireGuard, routeur 10.100.0.2 (`wg-nad`) vers hôte 10.100.0.1 (`wg0`) ; ping à travers environ 211 ms en moyenne, 0 % de perte |
 | FastTrack activé | Non (aucune règle configurée) |
 | LAN | `bridge1`, 192.168.26.0/24, routeur 192.168.26.1 ; serveur DHCP et Hotspot actifs |
-| Interfaces vues par SNMP | Entre autres `ether4`, `ether7`, `ether8`, `ether11` à `ether13`, `bridge1`, `bridge2`, `wg-nad`, `lo` |
-| Export de flux | IPFIX depuis `bridge1` seul, délais 1 m / 15 s ; valeurs de `in_if`/`out_if` : 16 (côté LAN) et 1 (côté liaison montante), noms à confirmer |
-| Adresses dans les flux | Montants : postes internes (192.168.26.x). Descendants : adresse traduite (192.168.1.x), à confirmer |
-| Volume brut des flux | Environ 1 Ko par ligne, 10 à 16 Mo par minute (15 à 23 Go par jour) ; gzip 30 à 40 fois plus petit |
-| Telegraf | Version 1.40.2, intervalle de 60 s, environ 280 Mo de RAM, stable sur 25 minutes |
-| Compteurs du tunnel | `wg-nad` affiche 988 erreurs en sortie le 2026-10-21 (à surveiller) |
+| Liaison montante | `ether1`, 192.168.1.101/24 attribuée par le routeur Starlink (double NAT) |
+| Autre réseau | `bridge2` (192.168.20.0/24) : réseau séparé à usage spécifique, hors périmètre, non exporté dans les flux |
+| Index d'interface (SNMP) | `ether1` à `ether13` = 1 à 13, `lo` = 15, `bridge1` = 16, `bridge2` = 17, `wg-nad` = 18 ; l'index 14 n'apparaît pas (non attribué) |
+| Export de flux | IPFIX depuis `bridge1` seul, délais 1 m / 15 s ; dans les flux, 16 = `bridge1`, 1 = `ether1`, 0 = le routeur lui-même |
+| Paires d'index dans les flux | 16 vers 1 et 1 vers 16 : environ 35 % ensemble ; 16 vers 0 et 0 vers 16 : environ 65 % ensemble (fichier actif de 142 956 flux) |
+| Trafic vers le routeur | Surtout TCP 443, UDP 53 (DNS), TCP 80, ports du Hotspot, UDP 67 (DHCP) |
+| Adresses dans les flux | Montants : postes internes (192.168.26.x). Descendants : adresse WAN du routeur (192.168.1.101) |
+| Volume brut des flux | Environ 1 Ko par ligne, 10 à 16 Mo par minute selon l'activité (15 à 23 Go par jour) ; gzip 30 à 40 fois plus petit |
+| Rotation des flux | `logrotate` (200 Mo, 300 archives) réveillé par `cron` toutes les 5 minutes ; archives de 4 à 6 Mo, une toutes les 15 à 45 minutes selon l'activité |
+| Disque | 4,9 Go utilisés sur 147 Go le 2026-10-22 |
+| Telegraf | Version 1.40.2, intervalle de 60 s, environ 280 Mo de RAM, stable ; étiquette `index` active sur les interfaces |
+| Compteurs du tunnel | `wg-nad` : 988 erreurs en sortie le 2026-10-21 à 18:05, 1 704 le 2026-10-22 à 23:34 (716 de plus en environ 29,5 h, pour environ 267 Mo émis) ; à surveiller |
+| Base SQLite | `/var/lib/nad/nad.db`, mode WAL, `user_version` 1, trois tables, test d'upsert et de contraintes réussi (2026-10-23) |
 | Format syslog observé | `<heure avec décalage> <adresse du routeur dans le tunnel> <topics> <message>`, horodaté à la réception dans le fuseau local de l'hôte **(à vérifier)** |
 | Charge du routeur, export éteint contre allumé | Pas encore mesurée |
 | Flux contre compteurs SNMP (ratio) | Pas encore mesuré |
@@ -989,16 +1286,26 @@ Remplis-le après chaque session. Ces valeurs alimentent les décisions de
 | goflow2 redémarre en boucle sous systemd | Dossier de sortie absent ou non inscriptible par `nad` | `sudo journalctl -u goflow2 -n 20` ; `ls -ld /var/lib/nad/flows` |
 | Avertissements `template error` dans goflow2 | Template pas encore reçu | Normal les premières secondes ; à examiner si ça dure plus de 2 minutes |
 | Le fichier de flux ne grossit pas | Service arrêté, ou routeur qui n'exporte pas | `systemctl is-active goflow2` ; `tcpdump` sur `wg0` |
-| Fichier de flux très volumineux | Rotation inactive | `systemctl is-active cron` ; `/etc/cron.d/nad-flows` ; `logrotate -d` |
 | Octets des flux bien inférieurs à SNMP | Hardware offload, perte de paquets | Drapeaux des ports du bridge, pertes UDP sur l'hôte |
 | Octets des flux supérieurs à SNMP | Même trafic exporté depuis plusieurs interfaces | Choix de l'interface d'export (`bridge1` ou `all`) |
 | Le CPU du routeur augmente nettement | Charge de l'export de flux | Phases A/B/C (étape 4.1) ; ajuster les délais ou activer l'échantillonnage |
+
+### Rotation, cron et disque
+
+| Symptôme | Cause probable | À vérifier |
+|---|---|---|
+| Le fichier de flux dépasse largement 200 Mo | `cron` inactif, ou fichier `/etc/cron.d/nad-flows` ignoré | `systemctl is-active cron` ; `cat /etc/cron.d/nad-flows` (propriétaire `root`, une ligne terminée par un saut de ligne, nom sans point) ; `sudo journalctl -u cron --since "30 min ago" \| grep nad-flows` |
+| `cron` lance la commande, mais aucune archive n'apparaît | Fichier sous le seuil de taille, ou erreur de `logrotate` | `sudo logrotate -d /etc/logrotate.d/nad-flows` ; messages d'erreur à l'écran |
+| Aucune archive de `router.log` après plusieurs jours | Minuteur du système absent ou inactif | `systemctl list-timers logrotate.timer` ; `sudo logrotate -d /etc/logrotate.d/mikrotik` |
+| Le disque se remplit | Rotation inactive, rétention trop longue, ou archive manuelle oubliée | `du -sh /var/lib/nad/*` ; `sudo ls -lh /var/lib/nad/flows/` ; réduire `rotate` si nécessaire |
+| `router.log` redevient lisible par tous après la rotation | Le nouveau fichier est créé sans `fileCreateMode` | Vérifier `10-mikrotik.conf` (`fileCreateMode="0640"`) et redémarrer rsyslog |
+| `metrics.jsonl` grossit sans limite | `rotation_interval` absent dans `90-output.conf` | `cat /etc/telegraf/telegraf.d/90-output.conf` ; redémarrer Telegraf |
 
 ### SNMP et sondes
 
 | Symptôme | Cause probable | À vérifier |
 |---|---|---|
-| `request timeout` dans Telegraf | Service désactivé, `addresses=` différent de `10.100.0.1/32`, règle `input` du pare-feu, ou entrée du routeur et `/etc/default/telegraf` qui ne correspondent pas | `/snmp print` ; `/snmp community print detail` ; `/ip firewall filter print where chain=input` ; `tcpdump -ni wg0 udp port 161` |
+| `request timeout` dans Telegraf | Service désactivé, `addresses=` différent de `10.100.0.1/32`, règle `input` du pare-feu, ou entrée du routeur et `/etc/default/telegraf` qui ne correspondent pas (nom d'utilisateur compris) | `/snmp print` ; `/snmp community print detail` ; `/ip firewall filter print where chain=input` ; `tcpdump -ni wg0 udp port 161` |
 | `Authentication failure` | Phrase de passe ou algorithme différents (SHA1 contre un autre) | Même valeur et même algorithme des deux côtés |
 | `Decryption error` | Phrase `PRIV` ou chiffrement différents | Même valeur des deux côtés |
 | `No Such Object available` | Cet OID n'est pas exposé par le routeur | `snmpwalk` de la branche parente |
@@ -1018,22 +1325,36 @@ Remplis-le après chaque session. Ces valeurs alimentent les décisions de
 | Un port de télémétrie est joignable depuis Internet | Règle ouverte chez le fournisseur, récepteur attaché à toutes les adresses | Règles du fournisseur ; `ss -lunp` ne doit montrer que `10.100.0.1` |
 | Configuration disparue après fermeture de SSH | Session fermée alors que le mode sûr était actif | Normal pour les tests ; `Ctrl+X` garde les changements |
 
+### Base de données
+
+| Symptôme | Cause probable | À vérifier |
+|---|---|---|
+| `database is locked` | Deux écrivains en même temps sans délai d'attente | `PRAGMA busy_timeout = 5000;` à chaque connexion ; un seul écrivain à la fois |
+| `attempt to write a readonly database` | Programme lancé avec un autre utilisateur que `nad`, ou droits du dossier | `ls -ld /var/lib/nad` ; lancer avec `sudo -u nad` |
+| Erreur à la création sur `STRICT` | Version de SQLite trop ancienne (avant 3.37) | `sqlite3 --version` ; retirer `STRICT` si nécessaire |
+| `CHECK constraint failed` | Fenêtre non alignée sur la minute, drapeau hors de 0 ou 1, différence de compteur négative | Valeurs envoyées par l'ingesteur ; compteur remis à zéro par un redémarrage du routeur |
+| Fichiers `nad.db-wal` et `nad.db-shm` qui traînent | Programme arrêté brutalement | Normal ; SQLite les reprend à la prochaine ouverture ; ne les supprime pas à la main |
+
 ## 13. Prochaines étapes
 
-1. Relier les index d'interface aux noms : ajouter `index_as_tag = true` à la
-   table d'interfaces de `10-snmp.conf`, et confirmer les index de la liaison
-   montante et du LAN vus dans les flux.
-2. Charge du routeur, phases A/B/C (étape 4.1), et ajout de la table de stockage
+1. Valider le lecteur de flux (`src/nad/collect/flows.py`) sur l'échantillon :
+   tests, puis résumé par minute.
+2. Écrire les fenêtres dans `nad.db` (upsert) et mémoriser la position de lecture
+   dans `file_offsets`, en lisant aussi les archives numérotées.
+3. Lecteur des mesures Telegraf : différences de compteurs, CPU, ping.
+4. Compteur de lignes de journal par minute.
+5. Résoudre les index d'interface à partir des noms au démarrage, au lieu des
+   valeurs écrites en dur.
+6. Charge du routeur, phases A/B/C (étape 4.1), et ajout de la table de stockage
    pour collecter la mémoire du routeur.
-3. Recoupement des flux avec les compteurs du bridge LAN (étape 4.2).
-4. Après la première rotation quotidienne, vérifier les permissions et la
+7. Recoupement des flux avec les compteurs du bridge LAN (étape 4.2).
+8. Après la première rotation quotidienne, vérifier les permissions et la
    rétention de `router.log`.
-5. Sonder des cibles Internet depuis une machine du réseau local du site, pour
+9. Sonder des cibles Internet depuis une machine du réseau local du site, pour
    compléter la sonde du tunnel.
-6. Squelette de l'ingesteur dans `src/nad/collect`, avec les adaptateurs et des
-   tests sur les échantillons capturés.
-7. Rôles Ansible qui installent et configurent les récepteurs sur l'hôte NAD
-   (goflow2, rsyslog, Telegraf, `logrotate`, unités systemd).
+10. Construction des fenêtres de cinq minutes et premier détecteur.
+11. Rôles Ansible qui installent et configurent les récepteurs sur l'hôte NAD
+    (goflow2, rsyslog, Telegraf, `logrotate`, `cron`, unités systemd).
 
 Durcissement ultérieur, hors de ce guide : une règle de pare-feu statique sur le
 routeur qui n'accepte l'UDP 161 que depuis `10.100.0.1`. Le routeur fait
@@ -1057,7 +1378,7 @@ un autre chantier.
 - **MIB :** un catalogue qui donne des noms aux OID. Les OID numériques
   fonctionnent sans lui.
 - **ifIndex :** le numéro qu'utilisent SNMP et les flux pour identifier une
-  interface.
+  interface. L'index 0, dans les flux, désigne le routeur lui-même.
 - **Compteur cumulatif :** une valeur qui ne fait que croître depuis le
   démarrage du routeur ; le trafic sur une période est la différence entre deux
   relevés.
@@ -1067,8 +1388,19 @@ un autre chantier.
   NAD ; tout ce qu'elle contient utilise des adresses privées.
 - **Rotation des journaux :** archiver et compresser un fichier qui grossit,
   puis en démarrer un nouveau, pour que le disque ne se remplisse jamais.
+- **logrotate :** l'outil standard de Linux qui fait la rotation d'après une
+  recette (taille, nombre d'archives, compression).
+- **cron :** le planificateur de tâches de Linux, un réveil qui lance une
+  commande à intervalles réguliers. Un fichier de `/etc/cron.d` contient une
+  ligne par tâche : cinq champs de temps, l'utilisateur, la commande.
 - **Fenêtre :** une tranche de temps fixe (une minute) dans laquelle tous les
   événements sont regroupés.
+- **Classe de flux :** la sorte de trafic d'un flux, déduite de la paire
+  d'index (montant, descendant, vers le routeur, depuis le routeur, autre).
+- **SQLite :** une base de données qui tient dans un seul fichier, sans serveur.
+- **WAL :** un mode de journal de SQLite où les lecteurs et l'écrivain ne se
+  bloquent pas.
+- **Upsert :** insérer une ligne, ou la mettre à jour si elle existe déjà.
 - **Idempotent :** exécuter une opération deux fois donne le même résultat que
   l'exécuter une seule fois.
 - **FastTrack :** une fonction MikroTik qui accélère le transfert en
@@ -1086,3 +1418,70 @@ un autre chantier.
   champs ; les données ne peuvent pas être décodées avant son arrivée.
 - **Mode sûr (safe mode) :** un mode de session RouterOS où les changements
   sont annulés sauf si tu choisis explicitement de les garder.
+
+## Annexe — Fichiers et chemins utilisés
+
+Tout se trouve sur l'hôte NAD, sauf mention contraire. Les droits sont ceux
+attendus après l'installation de ce guide.
+
+### Données et journaux
+
+| Chemin | Contenu | Propriétaire et droits | Écrit par |
+|---|---|---|---|
+| `/var/lib/nad/` | Dossier racine des données NAD | `nad:nad`, 750 | Étape 2.1 |
+| `/var/lib/nad/flows/flows.json` | Flux en cours d'écriture (JSON, une ligne par flux) | `nad:nad` | goflow2 |
+| `/var/lib/nad/flows/flows.json.N.gz` | Archives de la rotation (plus N est grand, plus c'est vieux) | `nad:nad` | `logrotate` |
+| `/var/lib/nad/telemetry/metrics.jsonl` | Mesures SNMP et ping (une ligne JSON par mesure), archives de rotation dans le même dossier | `telegraf:nad`, dossier en 755 | Telegraf |
+| `/var/lib/nad/nad.db` | Base SQLite (mode WAL) ; `nad.db-wal` et `nad.db-shm` apparaissent à côté quand un programme l'ouvre | `nad:nad` | Ingesteur |
+| `/var/log/mikrotik/router.log` | Journaux du routeur, archives `.1.gz` à `.14.gz` | `root:adm`, 640 | rsyslog |
+| `~/nad-samples/flows-sample.jsonl` | Échantillon de développement tiré d'une archive, **hors de Git** | Ton utilisateur, 600 | À la main (étape 3) |
+| `~/nad-private/before-nad.rsc` | Sauvegarde de la configuration du routeur, **hors de Git**, sur ton poste de travail | Ton utilisateur | À la main (étape 0) |
+
+### Configuration
+
+| Chemin | Rôle | Étape |
+|---|---|---|
+| `/etc/systemd/system/goflow2.service` | Service goflow2, démarre après le tunnel | 2.3 |
+| `/usr/local/bin/goflow2` | Binaire goflow2 | 2.3 |
+| `/etc/logrotate.d/nad-flows` | Recette de rotation des flux (200 Mo, 300 archives) | 2.3 |
+| `/etc/cron.d/nad-flows` | Réveille `logrotate` toutes les 5 minutes pour les flux | 2.3 |
+| `/etc/rsyslog.d/10-mikrotik.conf` | Réception du syslog sur l'adresse du tunnel et filtre vers `router.log` | 2.4 |
+| `/etc/systemd/system/rsyslog.service.d/wait-wg.conf` | rsyslog attend le tunnel avant de démarrer | 2.4 |
+| `/etc/logrotate.d/mikrotik` | Rotation quotidienne de `router.log` (14 jours) | 2.4 |
+| `/etc/telegraf/telegraf.conf` | Réglages généraux de Telegraf (intervalle 60 s) ; l'original est dans `telegraf.conf.orig` | 2.5 |
+| `/etc/telegraf/telegraf.d/10-snmp.conf` | Collecte SNMPv3 (uptime, CPU, interfaces) | 2.5 |
+| `/etc/telegraf/telegraf.d/20-probes.conf` | Ping vers le routeur | 2.5 |
+| `/etc/telegraf/telegraf.d/90-output.conf` | Sortie vers `metrics.jsonl`, rotation intégrée (24 h, 7 archives) | 2.5 |
+| `/etc/default/telegraf` | **Identifiants SNMP** : `root:telegraf`, 640. Ne va jamais dans Git, ne se tape jamais dans une commande | 2.5 |
+| `/etc/wireguard/wg0.conf` (probable) | Tunnel WireGuard, hors de ce guide | Prérequis |
+
+### Fournis par le système
+
+| Chemin | Rôle |
+|---|---|
+| `/usr/lib/systemd/system/telegraf.service` | Service Telegraf, installé par le paquet |
+| `/usr/lib/rsyslog/rsyslog-rotate` | Script qui demande à rsyslog de rouvrir son fichier après la rotation |
+| `/var/lib/logrotate/status` | Mémoire de `logrotate` : date de la dernière rotation de chaque fichier |
+
+### Dans le dépôt
+
+| Chemin | Rôle |
+|---|---|
+| `src/nad/collect/flows.py` | Lecteur de flux : fenêtres d'une minute, classes de trafic |
+| `tests/test_flows.py` | Tests du lecteur de flux |
+| `docs/guides/01-telemetry-and-ingestion.md` et `.fr.md` | Ce guide |
+| `docs/tools/tooling.md` et `.fr.md` | Comparaison et décisions d'outils |
+| `docs/diagrams/` | Diagrammes d'architecture (sources `.puml` et images `.png`) |
+
+### Contrôle rapide
+
+```bash
+sudo ls -ld /var/lib/nad /var/lib/nad/flows /var/lib/nad/telemetry /var/log/mikrotik
+sudo ls -l /var/lib/nad/nad.db /var/log/mikrotik/router.log /var/lib/nad/telemetry/metrics.jsonl
+sudo ls -l /etc/systemd/system/goflow2.service /etc/systemd/system/rsyslog.service.d/wait-wg.conf
+sudo ls -l /etc/rsyslog.d/10-mikrotik.conf /etc/logrotate.d/nad-flows /etc/logrotate.d/mikrotik /etc/cron.d/nad-flows
+sudo ls -l /etc/telegraf/telegraf.conf /etc/telegraf/telegraf.d/ /etc/default/telegraf
+```
+
+Une commande `ls` qui répond « Aucun fichier ou dossier de ce nom » indique une
+étape à refaire ou un nom de fichier qui diffère de celui du guide.
