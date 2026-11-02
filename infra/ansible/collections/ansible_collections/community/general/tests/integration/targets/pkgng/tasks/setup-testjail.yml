@@ -1,0 +1,74 @@
+---
+# Copyright (c) Ansible Project
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+#
+# Set up a thick jail with the FreeBSD base system and jail(8)
+# https://docs.freebsd.org/en/books/handbook/jails/
+#
+- name: Setup cloned interfaces
+  ansible.builtin.lineinfile:
+    dest: /etc/rc.conf
+    regexp: ^cloned_interfaces=lo1
+    line: cloned_interfaces=lo1
+
+- name: Activate cloned interfaces
+  ansible.builtin.command: "service netif cloneup"
+  changed_when: false
+
+- name: Load pf kernel module
+  ansible.builtin.command: "kldload -n pf"
+  changed_when: false
+
+- name: Add nat rule for cloned interfaces
+  ansible.builtin.copy:
+    dest: /etc/pf.conf
+    content: |
+      nat on {{ ansible_facts.default_ipv4.interface }} from 127.0.1.0/24 -> {{ ansible_facts.default_ipv4.interface }}:0
+    validate: "pfctl -nf %s"
+
+- name: Start pf firewall
+  ansible.builtin.service:
+    name: pf
+    state: started
+    enabled: true
+
+- name: Create testjail directory
+  ansible.builtin.file:
+    path: /usr/jails/testjail
+    state: directory
+    mode: "0755"
+
+- name: Download FreeBSD base system
+  ansible.builtin.get_url:
+    url: "https://download.freebsd.org/releases/{{ ansible_facts.architecture }}/{{ ansible_facts.distribution_version }}-RELEASE/base.txz"
+    dest: /usr/jails/base.txz
+    mode: "0644"
+
+- name: Extract FreeBSD base system into testjail
+  ansible.builtin.command:
+    cmd: tar -xf /usr/jails/base.txz -C /usr/jails/testjail
+    creates: /usr/jails/testjail/bin/sh
+
+- name: Configure testjail to use Cloudflare DNS
+  ansible.builtin.lineinfile:
+    dest: /usr/jails/testjail/etc/resolv.conf
+    regexp: "^nameserver[[:blank:]]+{{ item }}$"
+    line: "nameserver {{ item }}"
+    create: true
+  loop:
+    - "1.1.1.1"
+    - "1.0.0.1"
+
+- name: Is testjail running
+  ansible.builtin.command: "jls -j testjail"
+  changed_when: false
+  failed_when: false
+  register: is_testjail_up
+
+- name: Start testjail
+  when: is_testjail_up.rc != 0
+  ansible.builtin.command: >-
+    jail -c name=testjail path=/usr/jails/testjail host.hostname=testjail
+    ip4.addr=lo1|127.0.1.1 mount.devfs persist

@@ -1,0 +1,116 @@
+---
+####################################################################
+# WARNING: These are designed specifically for Ansible tests       #
+# and should not be used as examples of how to write Ansible roles #
+####################################################################
+
+# Copyright (c) Ansible Project
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Install required libs
+  ansible.builtin.pip:
+    name: python-gitlab
+    state: present
+
+- name: Clean up {{ gitlab_project_name }}
+  community.general.gitlab_project:
+    server_url: "{{ gitlab_host }}"
+    validate_certs: false
+    login_token: "{{ gitlab_login_token }}"
+    name: "{{ gitlab_project_name }}"
+    state: absent
+
+- name: Create {{ gitlab_project_name }}
+  community.general.gitlab_project:
+    server_url: "{{ gitlab_host }}"
+    validate_certs: false
+    login_token: "{{ gitlab_login_token }}"
+    name: "{{ gitlab_project_name }}"
+    initialize_with_readme: true
+    state: present
+  register: gitlab_project_state
+
+- ansible.builtin.assert:
+    that:
+      - gitlab_project_state is changed
+
+- name: Create {{ gitlab_project_name }} (Test idempotency)
+  community.general.gitlab_project:
+    server_url: "{{ gitlab_host }}"
+    validate_certs: false
+    login_token: "{{ gitlab_login_token }}"
+    name: "{{ gitlab_project_name }}"
+    state: present
+  register: gitlab_project_state_again
+
+- ansible.builtin.assert:
+    that:
+      - gitlab_project_state_again is not changed
+
+- name: Archive {{ gitlab_project_name }}
+  community.general.gitlab_project:
+    server_url: "{{ gitlab_host }}"
+    validate_certs: false
+    login_token: "{{ gitlab_login_token }}"
+    name: "{{ gitlab_project_name }}"
+    state: archived
+  register: gitlab_project_archived_state
+
+- ansible.builtin.assert:
+    that:
+      - gitlab_project_archived_state is changed
+
+- name: Archive {{ gitlab_project_name }} (Test idempotency)
+  community.general.gitlab_project:
+    server_url: "{{ gitlab_host }}"
+    validate_certs: false
+    login_token: "{{ gitlab_login_token }}"
+    name: "{{ gitlab_project_name }}"
+    state: archived
+  register: gitlab_project_archived_state_again
+
+- ansible.builtin.assert:
+    that:
+      - gitlab_project_archived_state_again is not changed
+
+- name: Change something in {{ gitlab_project_name }} while Archived
+  community.general.gitlab_project:
+    server_url: "{{ gitlab_host }}"
+    validate_certs: false
+    login_token: "{{ gitlab_login_token }}"
+    name: "{{ gitlab_project_name }}"
+    wiki_enabled: false
+    issues_enabled: true
+    state: archived
+  register: gitlab_project_attributes_archived_state
+
+- ansible.builtin.assert:
+    that:
+      - gitlab_project_attributes_archived_state is changed
+
+- name: Unarchive {{ gitlab_project_name }}
+  community.general.gitlab_project:
+    server_url: "{{ gitlab_host }}"
+    validate_certs: false
+    login_token: "{{ gitlab_login_token }}"
+    name: "{{ gitlab_project_name }}"
+    state: unarchived
+  register: gitlab_project_unarchived_state
+
+- ansible.builtin.assert:
+    that:
+      - gitlab_project_unarchived_state is changed
+
+- name: Unarchive {{ gitlab_project_name }} (Test idempotency)
+  community.general.gitlab_project:
+    server_url: "{{ gitlab_host }}"
+    validate_certs: false
+    login_token: "{{ gitlab_login_token }}"
+    name: "{{ gitlab_project_name }}"
+    state: unarchived
+  register: gitlab_project_unarchived_state_again
+
+- ansible.builtin.assert:
+    that:
+      - gitlab_project_unarchived_state_again is not changed

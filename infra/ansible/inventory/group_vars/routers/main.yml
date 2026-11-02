@@ -1,0 +1,2 @@
+router_api_user: ansible
+router_api_password: "{{ vault_router_api_password }}"

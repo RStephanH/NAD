@@ -1,0 +1,21 @@
+- name: Créer l'interface WireGuard (RouterOS génère la clé privée)
+  community.routeros.api_modify:
+    path: interface wireguard
+    data:
+      - name: "{{ wg_router_interface }}"
+        listen-port: 13231
+        mtu: 1420
+        comment: NAD tunnel
+
+- name: Lire la clé publique générée
+  community.routeros.api_info:
+    path: interface wireguard
+    include_read_only: true
+  register: ros_wg
+
+- name: Exposer la clé publique du routeur au hub
+  ansible.builtin.set_fact:
+    wg_public_key: >-
+      {{ (ros_wg.result
+          | selectattr('name', 'equalto', wg_router_interface)
+          | first)['public-key'] }}

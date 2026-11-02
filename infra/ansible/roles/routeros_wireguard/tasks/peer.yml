@@ -1,0 +1,39 @@
+- name: Adresse du routeur dans le tunnel
+  community.routeros.api_modify:
+    path: ip address
+    data:
+      - address: "{{ wg_address }}/{{ wg_prefix }}"
+        interface: "{{ wg_router_interface }}"
+        comment: NAD tunnel
+
+- name: Pair VPS (hub)
+  community.routeros.api_modify:
+    path: interface wireguard peers
+    data:
+      - name: vps-hub
+        interface: "{{ wg_router_interface }}"
+        public-key: "{{ hostvars[wg_hub_host].wg_public_key }}"
+        endpoint-address: "{{ wg_endpoint }}"
+        endpoint-port: "{{ wg_port }}"
+        allowed-address: "{{ wg_network }}"
+        persistent-keepalive: "{{ wg_keepalive }}s"
+        comment: NAD VPS hub
+
+- name: Lire les règles du pare-feu
+  community.routeros.api_info:
+    path: ip firewall filter
+  register: ros_fw
+
+- name: Autoriser la gestion depuis le laptop via le tunnel (en tête de input)
+  community.routeros.api:
+    path: ip firewall filter
+    add: >-
+      chain=input in-interface={{ wg_router_interface }}
+      src-address={{ hostvars['laptop'].wg_address }}
+      protocol=tcp dst-port=8729,22 action=accept comment=NAD-WG-mgmt
+      {{ ('place-before=' ~ ros_fw.result[0]['.id']) if ros_fw.result else '' }}
+  when: >-
+    ros_fw.result
+    | selectattr('comment', 'defined')
+    | selectattr('comment', 'equalto', 'NAD-WG-mgmt')
+    | list | length == 0

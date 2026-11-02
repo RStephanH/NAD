@@ -1,0 +1,28 @@
+all:
+  children:
+    wg_hub:
+      hosts:
+        vps:
+          ansible_host: 185.170.12.91
+          ansible_user: hernandez
+          wg_address: 10.100.0.1
+
+    wg_linux_peers:
+      hosts:
+        laptop:
+          ansible_connection: local
+          ansible_python_interpreter: "{{ ansible_playbook_python }}"
+          wg_address: 10.100.0.3
+
+    routers:
+      hosts:
+        rb1100:
+          ansible_connection: local
+          ansible_python_interpreter: "{{ ansible_playbook_python }}"
+          router_api_host: 192.168.26.1 # IP LAN du routeur au premier passage
+          wg_address: 10.100.0.2
+
+    wg_peers:
+      children:
+        wg_linux_peers:
+        routers:

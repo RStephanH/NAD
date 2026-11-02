@@ -1,0 +1,8 @@
+wg_interface: wg0
+wg_port: 51820
+wg_network: 10.100.0.0/24
+wg_prefix: 24
+wg_keepalive: 25
+wg_hub_host: "{{ groups['wg_hub'][0] }}"
+wg_endpoint: "{{ hostvars[wg_hub_host].ansible_host }}"
+wg_router_interface: wg-nad

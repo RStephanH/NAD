@@ -1,0 +1,32 @@
+---
+# Copyright (c) Ansible Project
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: nox
+'on':
+  push:
+    branches:
+      - main
+      - stable-*
+  pull_request:
+  # Run CI once per day (at 05:15 UTC)
+  schedule:
+    - cron: '15 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nox:
+    uses: ansible-community/antsibull-nox/.github/workflows/reusable-nox-run.yml@main
+    with:
+      session-name: Run extra sanity tests
+
+  ansible-test:
+    uses: ansible-community/antsibull-nox/.github/workflows/reusable-nox-matrix.yml@main
+    with:
+      upload-codecov: true
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

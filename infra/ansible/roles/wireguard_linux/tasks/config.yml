@@ -1,0 +1,23 @@
+- name: Activer le routage IPv4 (hub uniquement)
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_file: /etc/sysctl.d/99-wireguard.conf
+    reload: true
+  when: inventory_hostname in groups['wg_hub']
+
+- name: Déployer la configuration WireGuard
+  ansible.builtin.template:
+    src: wg.conf.j2
+    dest: /etc/wireguard/{{ wg_interface }}.conf
+    owner: root
+    group: root
+    mode: "0600"
+    backup: true
+  notify: Redémarrer WireGuard
+
+- name: Activer et démarrer le tunnel au boot
+  ansible.builtin.systemd:
+    name: wg-quick@{{ wg_interface }}
+    enabled: true
+    state: started

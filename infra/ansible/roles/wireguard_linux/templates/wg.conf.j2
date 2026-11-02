@@ -1,0 +1,24 @@
+# Géré par Ansible — ne pas modifier à la main
+[Interface]
+Address = {{ wg_address }}/{{ wg_prefix }}
+{% if inventory_hostname in groups['wg_hub'] %}
+ListenPort = {{ wg_port }}
+{% endif %}
+PostUp = wg set %i private-key /etc/wireguard/%i.key
+
+{% if inventory_hostname in groups['wg_hub'] %}
+{% for peer in groups['wg_peers'] %}
+[Peer]
+# {{ peer }}
+PublicKey = {{ hostvars[peer].wg_public_key }}
+AllowedIPs = {{ hostvars[peer].wg_address }}/32
+
+{% endfor %}
+{% else %}
+[Peer]
+# {{ wg_hub_host }}
+PublicKey = {{ hostvars[wg_hub_host].wg_public_key }}
+Endpoint = {{ wg_endpoint }}:{{ wg_port }}
+AllowedIPs = {{ wg_network }}
+PersistentKeepalive = {{ wg_keepalive }}
+{% endif %}

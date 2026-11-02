@@ -1,0 +1,63 @@
+- name: 1a. Clés WireGuard — VPS et laptop
+  hosts: wg_hub:wg_linux_peers
+  become: true
+  tasks:
+    - ansible.builtin.import_role:
+        name: wireguard_linux
+        tasks_from: keys.yml
+
+- name: 1b. Interface WireGuard — routeur
+  hosts: routers
+  gather_facts: false
+  module_defaults: &ros_api
+    group/community.routeros.api:
+      hostname: "{{ router_api_host }}"
+      username: "{{ router_api_user }}"
+      password: "{{ router_api_password }}"
+      tls: true
+      validate_certs: false
+      validate_cert_hostname: false
+  tasks:
+    - ansible.builtin.import_role:
+        name: routeros_wireguard
+        tasks_from: interface.yml
+
+- name: 2. Hub VPS — pare-feu et tunnel
+  hosts: wg_hub
+  become: true
+  tasks:
+    - ansible.builtin.import_role:
+        name: vps_firewall
+    - ansible.builtin.import_role:
+        name: wireguard_linux
+        tasks_from: config.yml
+
+- name: 3. Laptop de configuration
+  hosts: wg_linux_peers
+  become: true
+  tasks:
+    - ansible.builtin.import_role:
+        name: wireguard_linux
+        tasks_from: config.yml
+
+- name: 4. Routeur — pair VPS, adresse, accès de gestion
+  hosts: routers
+  gather_facts: false
+  module_defaults: *ros_api
+  tasks:
+    - ansible.builtin.import_role:
+        name: routeros_wireguard
+        tasks_from: peer.yml
+
+- name: 5. Vérification depuis le laptop
+  hosts: laptop
+  gather_facts: false
+  tasks:
+    - name: Ping du hub et du routeur à travers le tunnel
+      ansible.builtin.command: ping -c 3 -W 2 {{ hostvars[item].wg_address }}
+      loop: "{{ groups['wg_hub'] + groups['routers'] }}"
+      register: ping
+      until: ping.rc == 0
+      retries: 6
+      delay: 5
+      changed_when: false

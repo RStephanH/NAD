@@ -1,0 +1,35 @@
+- name: Installer UFW
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+- name: Autoriser SSH avant toute activation
+  community.general.ufw:
+    rule: limit
+    port: "{{ ansible_port | default(22) }}"
+    proto: tcp
+    comment: SSH administration
+
+- name: Ouvrir le port WireGuard
+  community.general.ufw:
+    rule: allow
+    port: "{{ wg_port }}"
+    proto: udp
+    comment: WireGuard NAD
+
+- name: Autoriser le transit entre pairs du tunnel (laptop -> routeur)
+  community.general.ufw:
+    rule: allow
+    route: true
+    interface_in: "{{ wg_interface }}"
+    interface_out: "{{ wg_interface }}"
+    comment: WireGuard peer-to-peer
+
+- name: Refuser par défaut le trafic entrant
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+- name: S'assurer que UFW est actif
+  community.general.ufw:
+    state: enabled

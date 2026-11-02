@@ -1,0 +1,28 @@
+- name: Installer WireGuard (Debian)
+  ansible.builtin.apt:
+    name: [wireguard, wireguard-tools]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_os_family == 'Debian'
+
+- name: Installer WireGuard (Arch)
+  community.general.pacman:
+    name: wireguard-tools
+    state: present
+  when: ansible_os_family == 'Archlinux'
+
+- name: Générer la clé privée sur l'hôte (seulement si absente)
+  ansible.builtin.shell: umask 077 && wg genkey > /etc/wireguard/{{ wg_interface }}.key
+  args:
+    creates: /etc/wireguard/{{ wg_interface }}.key
+
+- name: Lire la clé publique
+  ansible.builtin.shell: wg pubkey < /etc/wireguard/{{ wg_interface }}.key
+  register: wg_pub
+  changed_when: false
+  check_mode: false
+
+- name: Exposer la clé publique aux autres hôtes
+  ansible.builtin.set_fact:
+    wg_public_key: "{{ wg_pub.stdout }}"
